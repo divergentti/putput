@@ -1,27 +1,30 @@
-This repository contains some tiny scripts.
+Tiny Scripts Collection
 
+A set of small but powerful Python utilities for steganography and LLM interactions.
 1. Steganography Tool
 
-Hide messages or watermarks in images using adaptive LSB, DCT, or error-corrected methods.
-Key Features
+Hide messages or watermarks in images using adaptive LSB, DCT-based embedding, or error-corrected methods.
+Features
 
-    Adaptive LSB
+✅ Adaptive LSB
 
-        Dynamically adjusts LSBs (1-3 bits/channel) based on local pixel complexity.
+    Dynamically adjusts LSBs (1-3 bits per channel) based on local pixel complexity.
 
-        Hides more data in textured areas, fewer in smooth regions.
+    Maximizes data hiding in textured areas, minimizes artifacts in smooth regions.
 
-    DCT-based Steganography
+✅ DCT-based Steganography
 
-        Embeds data in mid-frequency coefficients (YCbCr color space).
+    Embeds data in mid-frequency DCT coefficients (YCbCr color space).
 
-        Better survives JPEG compression/resizing than spatial-domain methods.
+    More robust against JPEG compression/resizing than simple LSB methods.
 
-    Error Correction
+✅ Error Correction
 
-        Uses (7,4) Hamming codes to detect/correct single-bit errors.
+    Uses (7,4) Hamming codes to detect and correct single-bit errors.
 
 Usage
+sh
+Copy
 
 # Embed a message (DCT mode):
 python3 steganography.py embed input.png "secret" dct  
@@ -29,18 +32,60 @@ python3 steganography.py embed input.png "secret" dct
 # Extract from a DCT-processed image:
 python3 steganography.py extract output.jpg dct  
 
-Important Notes
+Notes
 
-    Not encryption: For confidentiality, pre-encrypt data (e.g., AES).
+🔹 Not encryption: For true secrecy, pre-encrypt data (e.g., AES).
+🔹 Best for PNGs: Lossless format preserves hidden data best.
+🔹 Capacity: Works best with small messages (<1% of image size).
+Use Cases
 
-    Best for PNGs: Lossless format preserves hidden data; JPEGs may degrade it.
+    📌 Invisible watermarking (copyright protection).
 
-    Capacity: Small messages (<1% of image size) work best.
+    🎓 Learning steganography techniques.
 
-Why Use This?
+    🏗 Lightweight Python (no heavy dependencies).
 
-    Watermarking: Embed invisible copyright tags.
+2. 2xLLM-blaa-blaa.py
 
-    Education: Learn steganography fundamentals.
+Make two LLMs chat with each other—one local (e.g., via LM Studio), the other via Mistral.ai API.
+Features
 
-    Lightweight: Pure Python, no heavy dependencies.
+✅ Multi-LLM Discussions
+
+    Run a conversation between a local LLM and a cloud-based LLM (Mistral.ai).
+
+    Flexible setup (swap models easily).
+
+✅ API + Local Combo
+
+    Useful for comparison testing or automated debates.
+
+Usage (Example)
+sh
+Copy
+
+python3 2xLLM-blaa-blaa.py --local-model "lm-studio/model.q4_k_m.gguf" --api-key "your_mistral_key"
+
+Possible Use Cases
+
+    🤖 Testing model responses side-by-side.
+
+    🧠 Automated debate simulations.
+
+    🔍 Comparing local vs. cloud-based LLMs.
+
+Installation
+sh
+Copy
+
+git clone https://github.com/divergentti/putput.git
+cd putput
+# Install dependencies if needed (e.g., numpy, requests)
+pip install -r requirements.txt  # (add if needed)
+
+Contributing
+
+Feel free to fork, improve, or suggest changes!
+
+🔗 Repository: github.com/divergentti/putput
+✍️ Author: Divergentti / Jari Hiltunen
