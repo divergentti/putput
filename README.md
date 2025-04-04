@@ -26,6 +26,7 @@ Embed a message (DCT mode): python3 steganography.py embed input.png "secret" dc
 Extract from a DCT-processed image: python3 steganography.py extract output.jpg dct  
 
 Notes
+
 🔹 Not encryption: For true secrecy, pre-encrypt data (e.g., AES).
 
 🔹 Best for PNGs: Lossless format preserves hidden data best.
