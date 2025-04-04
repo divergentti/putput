@@ -1,5 +1,5 @@
 """
-Version 0.0.2 by Divergentti / Jari Hiltunen
+Version 0.0.2 by Divergentti / Jari Hiltunen (04.04.2025)
 
 Steganography ≠ Encryption: It hides messages but doesn’t make them unreadable without extraction. 
 Basic image analysis tools can detect hidden data. For confidentiality, encrypt data first 
@@ -30,7 +30,7 @@ Examples:
 python3 steganography.py embed thecat.png "Hidden message" dct
 python3 steganography.py extract dct_encrypted_thecat.png
 
-Adaptive LSB Modification
+1. Adaptive LSB Modification
 
 Analyzes image complexity in local 3x3 pixel regions
 Uses 1-3 LSBs per channel based on region complexity
