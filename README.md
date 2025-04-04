@@ -4,8 +4,7 @@ A set of small but powerful Python utilities for steganography and LLM interacti
 
 **1. Steganography Tool**
 
-Hide messages or watermarks in images using adaptive LSB, DCT-based embedding, or error-corrected methods. 
-Passes png to jpeg conversions and size adjustments.
+Hide messages or watermarks in images using adaptive LSB, DCT-based embedding, and error-corrected methods. 
 
 **Features**
 
@@ -19,6 +18,8 @@ Passes png to jpeg conversions and size adjustments.
     
 ✅ Error Correction
     Uses (7,4) Hamming codes to detect and correct single-bit errors.
+
+**Passes png to jpeg conversions and size adjustments, such as uploading to LinkedIn as png and downloading as jpeg!**
 
 **Usage**
 
