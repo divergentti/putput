@@ -12,9 +12,11 @@ Passes png to jpeg conversions and size adjustments.
 ✅ Adaptive LSB
     Dynamically adjusts LSBs (1-3 bits per channel) based on local pixel complexity.
     Maximizes data hiding in textured areas, minimizes artifacts in smooth regions.
+    
 ✅ DCT-based Steganography
     Embeds data in mid-frequency DCT coefficients (YCbCr color space).
     More robust against JPEG compression/resizing than simple LSB methods.
+    
 ✅ Error Correction
     Uses (7,4) Hamming codes to detect and correct single-bit errors.
 
@@ -25,7 +27,9 @@ Extract from a DCT-processed image: python3 steganography.py extract output.jpg 
 
 Notes
 🔹 Not encryption: For true secrecy, pre-encrypt data (e.g., AES).
+
 🔹 Best for PNGs: Lossless format preserves hidden data best.
+
 🔹 Capacity: Works best with small messages (<1% of image size).
 
 **Use Cases**
