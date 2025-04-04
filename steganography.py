@@ -1,15 +1,20 @@
 """
 Version 0.0.2 by Divergentti / Jari Hiltunen
 
-Steganography is not encryption. It hides the message, but it doesn't make it unreadable without knowing how to
-extract it. Anyone with basic image analysis tools could potentially detect the hidden data. For true confidentiality,
-use proper encryption methods (e.g., AES) before embedding.
+Steganography ≠ Encryption: It hides messages but doesn’t make them unreadable without extraction. 
+Basic image analysis tools can detect hidden data. For confidentiality, encrypt data first 
+(e.g., AES) before embedding. This script also supports non-secret use cases like copyright watermarking 
+(e.g., embedding invisible ownership markers).
 
-PNG uses lossless compression, which means that altering individual bits is less likely to introduce noticeable
-artifacts compared to lossy formats like JPEG.
+PNG vs. JPEG Workflows:
 
-Capacity: The amount of data you can hide depends on the image size and color depth. Each bit requires one pixel
-(or part of a pixel). A small message will work fine; larger messages might become visible as distortions in the image.
+    PNG’s lossless compression allows bit-level edits with minimal artifacts.
+
+    JPEG’s lossy DCT-based compression distorts hidden data during conversions.
+    → Use DCT mode to embed data in mid-frequency coefficients, improving survivability in resizing/JPEG conversions.
+
+Capacity Limits: Data size depends on image resolution/color depth. 
+Small messages work well; larger ones risk visible distortions (1 bit ≈ 1 pixel/subpixel).
 
 Usage: python3 steganography.py [mode] <image_path> [method]
 
