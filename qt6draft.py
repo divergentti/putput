@@ -68,9 +68,6 @@ def quantize_coefficients(dct_block, quant_table):
     return np.round(dct_block / quant_table)
 
 
-
-
-
 def crc32_checksum(data):
     """Calculate CRC32 checksum for data verification."""
     return zlib.crc32(data) & 0xffffffff
@@ -138,54 +135,67 @@ def bytes_to_binary_string(data):
     return ''.join([format(byte, '08b') for byte in data])
 
 def binary_string_to_bytes(binary_string):
-    """Convert binary string back to bytes with debug output."""
-    bytes_data = bytes()
-    for i in range(0, len(binary_string), 8):
-        byte_str = binary_string[i:i+8]
-        if len(byte_str) < 8:
-            break  # Discard incomplete byte
-        byte = int(byte_str, 2)
-        bytes_data += struct.pack('B', byte)
-    if debug:
-        print(f"Binary String (first 64 bits): {binary_string[:64]}...")
-        print(f"Converted Bytes: {bytes_data.hex()}")
-    binary_string = binary_string[:len(binary_string) // 8 * 8]  # Trim to whole bytes
-    return bytes([int(binary_string[i:i + 8], 2) for i in range(0, len(binary_string), 8)])
-
+    """Robust binary conversion with padding"""
+    # Pad with zeros to make length multiple of 8
+    padded = binary_string.ljust((len(binary_string) + 7) // 8 * 8, '0')
+    return bytes([int(padded[i:i+8], 2) for i in range(0, len(padded), 8)])
 
 # Better length encoding with redundancy and checksum
 def encode_length_with_magic_marker(length):
-    """Encode length with magic marker and CRC32 checksum."""
+    """Encode length with strict validation and debug output"""
+    if length < 0 or length > MAX_MESSAGE_SIZE:
+        raise ValueError(f"Invalid length: {length}")
+
     magic = 0xA55A
     length_data = struct.pack('>HI', magic, length)
     checksum = struct.pack('>I', crc32_checksum(length_data))
-    return bytes_to_binary_string(length_data + checksum) * 3  # Triple redundancy
+
+    if debug:
+        print(f"Raw Length Data (hex): {length_data.hex()}{checksum.hex()}")
+
+    return bytes_to_binary_string(length_data + checksum) * 3
 
 
 def decode_length_with_magic_marker(binary_data):
-    """Decode length from redundant binary data."""
+    """Decode length with enhanced validation"""
     bytes_data = binary_string_to_bytes(binary_data)
 
-    # Check all 3 redundant copies
-    for i in [0, 10, 20]:  # Positions of redundant copies
-        if i + 10 > len(bytes_data):
+    if debug:
+        print(f"Received Bytes (hex): {bytes_data.hex()}")
+        print(f"Total Bytes for Length: {len(bytes_data)} (needs at least 30)")
+
+    # Check all 3 copies of the 10-byte struct
+    for offset in [0, 10, 20]:
+        if offset + 10 > len(bytes_data):
             continue
 
-        chunk = bytes_data[i:i + 10]
+        chunk = bytes_data[offset:offset + 10]
         try:
             magic, length = struct.unpack('>HI', chunk[:6])
             stored_checksum = struct.unpack('>I', chunk[6:10])[0]
+            calculated_checksum = crc32_checksum(chunk[:6])
 
-            if magic == 0xA55A and crc32_checksum(chunk[:6]) == stored_checksum:
+            if debug:
+                print(f"Checking chunk @ offset {offset}:")
+                print(f"Magic: {magic:04X} (should be A55A)")
+                print(f"Length: {length}")
+                print(f"Checksum: stored={stored_checksum:08X}, calculated={calculated_checksum:08X}")
+
+            if magic == 0xA55A and stored_checksum == calculated_checksum:
                 return min(length, MAX_MESSAGE_SIZE)
-        except:
+        except Exception as e:
+            if debug:
+                print(f"Chunk error @ {offset}: {str(e)}")
             continue
 
-    return 0  # No valid copy found
+    return 0
 
 def adaptive_lsb_embed(img, binary_message):
     """Enhanced adaptive LSB algorithm focusing on stable areas."""
     width, height = img.size
+    max_bits = ((width - 2) // 2) * ((height - 2) // 2) * 3  # 3 channels
+    if len(binary_message) > max_bits:
+        raise ValueError(f"Message too long: {len(binary_message)} > {max_bits} bits")
     pixels = np.array(img)
     img_copy = img.copy()
     message_length = len(binary_message)
@@ -207,8 +217,17 @@ def adaptive_lsb_embed(img, binary_message):
                         data_index += 1
                 img_copy.putpixel((x, y), tuple(pixel))
 
+    if debug and data_index < len(binary_message):
+        print(f"EMBED FAILURE: Only embedded {data_index}/{len(binary_message)} bits")
+
     return img_copy, data_index
 
+def verify_length_embedding(img):
+    """Immediately verify the embedded length"""
+    length_info_size = len(encode_length_with_magic_marker(0))
+    extracted_binary = adaptive_lsb_extract(img, length_info_size)
+    # Pass the BINARY STRING directly to decoder
+    return decode_length_with_magic_marker(extracted_binary)  # NOT the bytes!
 
 def adaptive_lsb_extract(img, message_length):
     """Extract bits from smooth regions using first LSB."""
@@ -473,6 +492,14 @@ def secure_hybrid_embed(image_path, message, start_char='#', stop_char='$'):
         # Verify embedding success
         if embedded_bits < message_length:
             print(f"Warning: Could only embed {embedded_bits} of {message_length} bits")
+
+        # Verification step
+        verified_length = verify_length_embedding(img_with_length)
+        if verified_length != message_length:
+            raise RuntimeError(
+                f"Length verification failed! "
+                f"Embedded: {message_length}, Extracted: {verified_length}"
+            )
 
         # Save in original format
         original_dir = os.path.dirname(abs_path)
