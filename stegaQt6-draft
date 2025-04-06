@@ -1,5 +1,8 @@
 """
 Not functional yet!
+
+sudo apt-get install -y libxcb-cursor-dev
+
 """
 
 import sys
@@ -27,7 +30,7 @@ MAX_MESSAGE_SIZE = 100000  # Safety limit for message size in bits
 MAX_DCT_ALPHA = 25  # Increased strength for DCT embedding
 
 # Reed-Solomon error correction parameters
-RS_REDUNDANCY = 35  # Increased redundancy for better error correction
+RS_REDUNDANCY = 20  # Increased redundancy for better error correction
 
 
 def crc32_checksum(data):
@@ -89,155 +92,103 @@ def rs_encoded_to_text(encoded_data, redundancy=RS_REDUNDANCY):
 
 
 def bytes_to_binary_string(data):
-    """Convert bytes to a binary string."""
-    result = ""
-    for byte in data:
-        result += format(byte, '08b')
-    return result
-
+    """Convert bytes to a binary string with debug output."""
+    binary = ''.join(format(byte, '08b') for byte in data)
+    if debug:
+        print(f"Original Bytes: {data.hex()}")
+        print(f"Generated Binary: {binary[:64]}... (truncated)")
+    return ''.join([format(byte, '08b') for byte in data])
 
 def binary_string_to_bytes(binary_string):
-    """Convert binary string back to bytes."""
-    result = bytearray()
+    """Convert binary string back to bytes with debug output."""
+    bytes_data = bytes()
     for i in range(0, len(binary_string), 8):
-        if i + 8 <= len(binary_string):
-            byte = int(binary_string[i:i + 8], 2)
-            result.append(byte)
-    return bytes(result)
+        byte_str = binary_string[i:i+8]
+        if len(byte_str) < 8:
+            break  # Discard incomplete byte
+        byte = int(byte_str, 2)
+        bytes_data += struct.pack('B', byte)
+    if debug:
+        print(f"Binary String (first 64 bits): {binary_string[:64]}...")
+        print(f"Converted Bytes: {bytes_data.hex()}")
+    binary_string = binary_string[:len(binary_string) // 8 * 8]  # Trim to whole bytes
+    return bytes([int(binary_string[i:i + 8], 2) for i in range(0, len(binary_string), 8)])
 
 
 # Better length encoding with redundancy and checksum
 def encode_length_with_magic_marker(length):
-    """Encode message length with magic marker, checksum and redundancy."""
+    """Encode length with magic marker and CRC32 checksum."""
     magic = 0xA55A
     length_data = struct.pack('>HI', magic, length)
-    checksum = crc32_checksum(length_data)
-    length_data_with_checksum = length_data + struct.pack('>I', checksum)
-    binary_length = bytes_to_binary_string(length_data_with_checksum)
-    redundant_length = binary_length * 3
-
-    if debug:
-        print(f"Encoded Length Binary: {binary_length}")
-        print(f"Redundant Length Binary: {redundant_length}")
-
-    return redundant_length
+    checksum = struct.pack('>I', crc32_checksum(length_data))
+    return bytes_to_binary_string(length_data + checksum) * 3  # Triple redundancy
 
 
 def decode_length_with_magic_marker(binary_data):
-    """Decode message length using magic marker and checksum verification."""
-    byte_length = len(binary_data) // 8
-    bytes_data = binary_string_to_bytes(binary_data[:byte_length * 8])
-    struct_size = 10
+    """Decode length from redundant binary data."""
+    bytes_data = binary_string_to_bytes(binary_data)
 
-    if debug:
-        print(f"Decoding Length from Binary Data: {binary_data[:byte_length * 8]}")
-        print(f"Bytes Data: {bytes_data}")
-
-    for i in range(0, len(bytes_data) - struct_size + 1, struct_size):
-        chunk = bytes_data[i:i + struct_size]
-        if len(chunk) < struct_size:
+    # Check all 3 redundant copies
+    for i in [0, 10, 20]:  # Positions of redundant copies
+        if i + 10 > len(bytes_data):
             continue
 
+        chunk = bytes_data[i:i + 10]
         try:
-            magic = struct.unpack('>H', chunk[0:2])[0]
-            length = struct.unpack('>I', chunk[2:6])[0]
+            magic, length = struct.unpack('>HI', chunk[:6])
             stored_checksum = struct.unpack('>I', chunk[6:10])[0]
 
-            if debug:
-                print(f"Checking chunk at index {i}: Magic={magic}, Length={length}, Checksum={stored_checksum}")
-
-            if magic != 0xA55A:
-                continue
-
-            calculated_checksum = crc32_checksum(chunk[0:6])
-            if stored_checksum != calculated_checksum:
-                continue
-
-            if 0 <= length <= MAX_MESSAGE_SIZE:
-                if debug:
-                    print(f"Decoded Length: {length}")
-                return length
-        except struct.error:
+            if magic == 0xA55A and crc32_checksum(chunk[:6]) == stored_checksum:
+                return min(length, MAX_MESSAGE_SIZE)
+        except:
             continue
 
-    if debug:
-        print("Failed to decode valid length from binary data.")
-
-    return 0
-
+    return 0  # No valid copy found
 
 def adaptive_lsb_embed(img, binary_message):
-    """Enhanced adaptive LSB algorithm focusing on stable areas of the image."""
+    """Enhanced adaptive LSB algorithm focusing on stable areas."""
     width, height = img.size
     pixels = np.array(img)
     img_copy = img.copy()
-
-    # Prepare message index
     message_length = len(binary_message)
     data_index = 0
 
-    # Focus on smooth areas of the image for embedding
     for y in range(1, height - 1, 2):
         for x in range(1, width - 1, 2):
             if data_index >= message_length:
                 break
 
-            # Get 3x3 region
-            region = pixels[max(0, y - 1):min(height, y + 2), max(0, x - 1):min(width, x + 2)]
-
-            # Only embed in areas with low variance (more stable under compression)
-            if np.var(region) < 100:  # Low variance threshold
+            region = pixels[max(0, y - 1):y + 2, max(0, x - 1):x + 2]
+            if np.var(region) < 100:
                 pixel = list(img.getpixel((x, y)))
-
-                # Embed in each channel with double bits for redundancy
-                for i in range(3):  # RGB channels
+                for i in range(3):
                     if data_index < message_length:
-                        # Clear 2 LSBs
-                        pixel[i] = pixel[i] & ~3  # ~3 is the same as ~0b11
-
-                        # Embed bit twice (for redundancy)
+                        # Clear 2 LSBs and embed the same bit twice
                         bit = int(binary_message[data_index])
-                        pixel[i] |= (bit << 1) | bit
+                        pixel[i] = (pixel[i] & ~3) | (bit << 1) | bit
                         data_index += 1
-
                 img_copy.putpixel((x, y), tuple(pixel))
 
     return img_copy, data_index
 
 
 def adaptive_lsb_extract(img, message_length):
-    """Extract from enhanced adaptive LSB, using majority voting on redundant bits."""
+    """Extract bits from smooth regions using first LSB."""
+    binary_message = []
     width, height = img.size
-    pixels = np.array(img)
-    binary_message = ""
-    data_index = 0
 
     for y in range(1, height - 1, 2):
         for x in range(1, width - 1, 2):
-            if data_index >= message_length:
+            if len(binary_message) >= message_length:
                 break
 
-            # Get 3x3 region
-            region = pixels[max(0, y - 1):min(height, y + 2), max(0, x - 1):min(width, x + 2)]
+            pixel = img.getpixel((x, y))
+            # Extract only the first LSB (ignore redundancy)
+            for channel in pixel[:3]:  # RGB channels
+                if len(binary_message) < message_length:
+                    binary_message.append(str((channel >> 1) & 1))  # Use first redundant bit
 
-            # Extract from same areas we embedded in
-            if np.var(region) < 100:  # Same threshold as embedding
-                pixel = list(img.getpixel((x, y)))
-
-                # Extract from each channel
-                for i in range(3):  # RGB channels
-                    if data_index < message_length:
-                        # Extract the two redundant bits and take majority
-                        bit1 = (pixel[i] >> 1) & 1
-                        bit0 = pixel[i] & 1
-
-                        # If they're the same, that's our bit
-                        # If different, trust bit1 (less likely to be corrupted)
-                        binary_message += str(bit1)
-                        data_index += 1
-
-    return binary_message
-
+    return ''.join(binary_message)
 
 def rgb_to_ycbcr(img):
     """Convert RGB image to YCbCr color space."""
@@ -373,7 +324,8 @@ def dct_embed(img, binary_message):
 
                 # Debug: Print the modified block
                 if debug:
-                    print(f"Modified Dark Block at ({x},{y}):\n{modified_block}")
+                    pass
+                    # print(f"Modified Dark Block at ({x},{y}):\n{modified_block}")
 
     # Convert back to RGB
     rgb = ycbcr_to_rgb(ycbcr)
@@ -437,9 +389,10 @@ def secure_hybrid_embed(image_path, message, start_char='#', stop_char='$'):
         original_format_to_save = img.format  # Save original format for later
         original_format = img.format
 
+
         # Convert to RGB if needed
         if img.mode != "RGB":
-            img = img.convert("RGB")
+           img = img.convert("RGB")
 
         # Convert to PNG in-memory if original format is not PNG
         if original_format.upper() != 'PNG':
@@ -490,7 +443,7 @@ def secure_hybrid_embed(image_path, message, start_char='#', stop_char='$'):
         if original_format_to_save == "JPEG":
             modified_img.save(modified_image_path, original_format_to_save, quality=100, subsampling=0)
         else:
-            modified_img.save(modified_image_path, original_format_to_save)
+            modified_img.save(modified_image_path, format='PNG')
 
         return modified_image_path
 
@@ -529,6 +482,8 @@ def secure_hybrid_extract(image_path, start_char='#', stop_char='$'):
 
         # Extract main message using DCT
         binary_message = dct_extract(img, message_length)
+        if len(binary_message) < message_length:
+            return f"ERROR: Only {len(binary_message)}/{message_length} bits extracted"
 
         extracted_length = len(binary_message)
         if extracted_length < message_length:
@@ -556,7 +511,15 @@ def secure_hybrid_extract(image_path, start_char='#', stop_char='$'):
             print("Stop marker not found")
             return None
 
-        # Extract message between markers
+        if not decoded_text:
+            print("Reed-Solomon decoding failed")
+            return "DECODING FAILED: Reed-Solomon error"
+
+        # Find start and stop markers
+        start_index = decoded_text.find(start_char)
+        if start_index == -1:
+            return "MARKER ERROR: Start character not found"
+
         return decoded_text[start_index + 1:stop_index]
 
     except Exception as e:
@@ -729,7 +692,7 @@ class MainWindow(QMainWindow):
 
     def handle_encrypt(self):
         path = self.path_edit.text()
-        message = self.message_input.text()
+        message = self.message_input.text().strip()  # Clean whitespace
 
         if not path:
             self.status_bar.showMessage("Please select an input file or folder!")
@@ -748,11 +711,26 @@ class MainWindow(QMainWindow):
                 if not os.path.exists(output_path):
                     raise RuntimeError(f"Failed to create output file at {output_path}")
 
-                # Show success message
+                # Verification phase
                 success_msg = (f"Encryption successful using\n"
                                f"Original: {os.path.basename(path)}\n"
                                f"Saved to: {os.path.basename(output_path)}")
-                QMessageBox.information(self, "Success", success_msg)
+
+                try:
+                    decrypted = secure_hybrid_extract(output_path)
+                    if decrypted is None:
+                        success_msg += "\n\nDecryption verification FAILED - No message found"
+                    elif decrypted != message:
+                        success_msg += (f"\n\nDECRYPTION MISMATCH!\n"
+                                        f"Original: {message}\n"
+                                        f"Decrypted: {decrypted}")
+                    else:
+                        success_msg += "\n\nDecryption verified - Message matches perfectly"
+                except Exception as e:
+                    success_msg += f"\n\nDecryption verification ERROR: {str(e)}"
+
+                # Show comprehensive result
+                QMessageBox.information(self, "Encryption Result", success_msg)
                 self.status_bar.showMessage(f"Saved encrypted file: {output_path}")
 
                 # Update preview
