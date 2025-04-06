@@ -33,6 +33,43 @@ MAX_DCT_ALPHA = 25  # Increased strength for DCT embedding
 RS_REDUNDANCY = 20  # Increased redundancy for better error correction
 
 
+class CoordinateTracker:
+    """Track used DCT block coordinates"""
+    def __init__(self, max_coords):
+        self.used = set()
+        self.max_coords = max_coords
+
+    def add(self, x, y):
+        if (x, y) in self.used or len(self.used) >= self.max_coords:
+            return False
+        self.used.add((x, y))
+        return True
+
+# Add to constants
+DCT_SIZE = 8
+ZIGZAG_ORDER = [
+    (0,0), (0,1), (1,0), (2,0), (1,1), (0,2), (0,3), (1,2),
+    (2,1), (3,0), (4,0), (3,1), (2,2), (1,3), (0,4), (0,5),
+    (1,4), (2,3), (3,2), (4,1), (5,0), (6,0), (5,1), (4,2),
+    (3,3), (2,4), (1,5), (0,6), (0,7), (1,6), (2,5), (3,4),
+    (4,3), (5,2), (6,1), (7,0), (7,1), (6,2), (5,3), (4,4),
+    (3,5), (2,6), (1,7), (2,7), (3,6), (4,5), (5,4), (6,3),
+    (7,2), (7,3), (6,4), (5,5), (4,6), (3,7), (4,7), (5,6),
+    (6,5), (7,4), (7,5), (6,6), (5,7), (6,7), (7,6), (7,7)
+]
+
+def is_mid_frequency(coeff_index):
+    """Check if coefficient is in mid-frequency range"""
+    return 5 < coeff_index < 58
+
+def quantize_coefficients(dct_block, quant_table):
+    """Quantize DCT coefficients using JPEG quantization table"""
+    return np.round(dct_block / quant_table)
+
+
+
+
+
 def crc32_checksum(data):
     """Calculate CRC32 checksum for data verification."""
     return zlib.crc32(data) & 0xffffffff
@@ -299,80 +336,83 @@ def dct_embed(img, binary_message):
     dark_threshold = 100  # Adjust this value based on your needs
 
     # Process 8x8 blocks with spacing for resilience
-    for y in range(0, height_pad, 16):  # Use every other block
-        for x in range(0, width_pad, 16):  # Use every other block
+    for y in range(0, height_pad, 8):
+        for x in range(0, width_pad, 8):
             if data_index >= message_length:
                 break
 
-            # Get the Y channel block
-            block = ycbcr[y:y + 8, x:x + 8, 0].copy()
+            block = ycbcr[y:y+8, x:x+8, 0]  # Use Y channel
 
-            # Check if the block is dark
+            # Embed only in dark regions to minimize visual artifacts
             if np.mean(block) < dark_threshold:
-                # Determine bits to embed in this block
-                bits_to_embed = binary_message[data_index:min(data_index + 5, message_length)]
-                if not bits_to_embed:  # Skip if no more bits
-                    break
+                bits = binary_message[data_index:data_index+7]  # 7 bits per block
+                if len(bits) < 7:
+                    bits = bits.ljust(7, '0')  # Pad if necessary
 
-                data_index += len(bits_to_embed)
-
-                # Embed bits
-                modified_block = embed_in_dct_block(block, bits_to_embed)
-
-                # Update block
-                ycbcr[y:y + 8, x:x + 8, 0] = modified_block
-
-                # Debug: Print the modified block
-                if debug:
-                    pass
-                    # print(f"Modified Dark Block at ({x},{y}):\n{modified_block}")
+                modified_block = embed_in_dct_block(block, bits)
+                ycbcr[y:y+8, x:x+8, 0] = modified_block
+                data_index += 7
 
     # Convert back to RGB
-    rgb = ycbcr_to_rgb(ycbcr)
-
-    # Create new image
-    dct_img = Image.fromarray(rgb)
-    return dct_img, data_index
+    rgb_array = ycbcr_to_rgb(ycbcr)
+    result_img = Image.fromarray(rgb_array.astype(np.uint8))
+    return result_img, data_index
 
 
-
-def dct_extract(img, message_length):
-    """Extract message using improved DCT-based steganography."""
-    # Convert to YCbCr
+def dct_extract(img, message_length, password=None):
+    """Improved DCT extraction with Java-inspired features"""
     ycbcr = rgb_to_ycbcr(img)
-
-    # Get image dimensions
     height, width, _ = ycbcr.shape
+    quant_table = np.array([
+        [16, 11, 10, 16, 24, 40, 51, 61],
+        [12, 12, 14, 19, 26, 58, 60, 55],
+        [14, 13, 16, 24, 40, 57, 69, 56],
+        [14, 17, 22, 29, 51, 87, 80, 62],
+        [18, 22, 37, 56, 68, 109, 103, 77],
+        [24, 35, 55, 64, 81, 104, 113, 92],
+        [49, 64, 78, 87, 103, 121, 120, 101],
+        [72, 92, 95, 98, 112, 100, 103, 99]
+    ])
 
-    # Ensure dimensions are multiples of 8
-    height_pad = height - (height % 8)
-    width_pad = width - (width % 8)
+    # Initialize password-based random generator
+    seed = int(hashlib.sha256(password.encode()).hexdigest(), 16) & 0xffffffff if password else 0
+    rand = random.Random(seed)
 
-    # Prepare for extraction
-    binary_message = ""
+    coord_tracker = CoordinateTracker((width * height) // (DCT_SIZE ** 2))
+    bits = []
 
-    # Process 8x8 blocks with same spacing as embedding
-    for y in range(0, height_pad, 16):  # Every other block
-        for x in range(0, width_pad, 16):  # Every other block
-            if len(binary_message) >= message_length:
+    while len(bits) < message_length:
+        # Find unused coordinates
+        while True:
+            xb = rand.randint(0, (width // DCT_SIZE) - 1)
+            yb = rand.randint(0, (height // DCT_SIZE) - 1)
+            if coord_tracker.add(xb, yb):
                 break
 
-            # Get the Y channel block
-            block = ycbcr[y:y + 8, x:x + 8, 0].copy()
+        # Extract block and convert to Y channel
+        block = ycbcr[yb * DCT_SIZE:(yb + 1) * DCT_SIZE, xb * DCT_SIZE:(xb + 1) * DCT_SIZE, 0]
+        block = block.astype(np.float64) - 128  # Center around zero
 
-            # Extract bits
-            bits = extract_from_dct_block(block)
+        # Perform DCT
+        dct_block = dct(dct(block.T, norm='ortho').T, norm='ortho')
 
-            # Add bits to message
-            remaining = message_length - len(binary_message)
-            binary_message += bits[:min(5, remaining)]
+        # Quantize coefficients
+        quantized = quantize_coefficients(dct_block, quant_table)
 
-            # Debug: Print the extracted bits
-            if debug:
-                print(f"Extracted Bits at ({x},{y}): {bits[:min(5, remaining)]}")
+        # Select random mid-frequency coefficient
+        while True:
+            coeff_index = rand.randint(1, len(ZIGZAG_ORDER) - 2)
+            if is_mid_frequency(coeff_index):
+                i, j = ZIGZAG_ORDER[coeff_index]
+                break
 
-    return binary_message
+        # Extract LSB
+        bits.append(str(int(quantized[i, j]) & 1))
 
+        if len(bits) >= message_length:
+            break
+
+    return ''.join(bits[:message_length])
 
 
 
@@ -454,17 +494,16 @@ def secure_hybrid_embed(image_path, message, start_char='#', stop_char='$'):
         return None
 
 
-def secure_hybrid_extract(image_path, start_char='#', stop_char='$'):
-    """Extracts a message from an image using improved hybrid steganography."""
+def secure_hybrid_extract(image_path, password=None, start_char='#', stop_char='$'):
+    """Updated extraction with password support"""
     try:
-        # Open image
-        img = Image.open(image_path)
-        img = img.convert("RGB")
+        img = Image.open(image_path).convert("RGB")
 
-        # First extract the length with redundancy and checksum verification
-        # We extract more bits than we need to ensure we get the full length data
+        # Length extraction remains the same
         length_info_size = len(encode_length_with_magic_marker(0))
         length_binary = adaptive_lsb_extract(img, length_info_size * 2)
+        message_length = decode_length_with_magic_marker(length_binary)
+
 
         if debug:
             print(f"Length_info: {length_info_size}")
@@ -480,8 +519,10 @@ def secure_hybrid_extract(image_path, start_char='#', stop_char='$'):
         if debug:
             print(f"Detected message length: {message_length} bits")
 
-        # Extract main message using DCT
-        binary_message = dct_extract(img, message_length)
+        # Use new DCT extraction with password
+        binary_message = dct_extract(img, message_length, password)
+
+        #binary_message = dct_extract(img, message_length)
         if len(binary_message) < message_length:
             return f"ERROR: Only {len(binary_message)}/{message_length} bits extracted"
 
@@ -573,6 +614,12 @@ class MainWindow(QMainWindow):
         path_layout.addWidget(self.path_edit)
         path_layout.addWidget(self.browse_btn)
         layout.addLayout(path_layout)
+
+        self.password_label = QLabel("Password:")
+        self.password_input = QLineEdit()
+        self.password_input.setEchoMode(QLineEdit.EchoMode.Password)
+        layout.addWidget(self.password_label)
+        layout.addWidget(self.password_input)
 
         # Message input
         self.message_label = QLabel("Secret Message:")
@@ -693,6 +740,7 @@ class MainWindow(QMainWindow):
     def handle_encrypt(self):
         path = self.path_edit.text()
         message = self.message_input.text().strip()  # Clean whitespace
+        password = self.password_input.text()
 
         if not path:
             self.status_bar.showMessage("Please select an input file or folder!")
@@ -749,9 +797,11 @@ class MainWindow(QMainWindow):
 
     def handle_decrypt(self):
         path = self.path_edit.text()
+        password = self.password_input.text()
 
         try:
-            message = secure_hybrid_extract(path)
+            message = secure_hybrid_extract(path, password)
+
             if message:
                 QMessageBox.information(self, "Decrypted Message", message)
                 self.status_bar.showMessage("Message extracted successfully")
@@ -795,6 +845,7 @@ Usage Tips:
 
 Note: Always keep original files as some platforms may alter images"""
         QMessageBox.information(self, "Help", help_text)
+
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
