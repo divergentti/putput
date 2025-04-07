@@ -1,255 +1,190 @@
 """
-Not functional yet!
+Version 0.0.1 by Divergentti / Jari Hiltunen (07.04.2025)
 
-sudo apt-get install -y libxcb-cursor-dev
+Steganography ≠ Encryption: It hides messages but doesn’t make them unreadable without extraction.
+Basic image analysis tools can detect hidden data. For confidentiality, encrypt data first
+(e.g., AES) before embedding. This script also supports non-secret use cases like copyright watermarking
+(e.g., embedding invisible ownership markers).
 
+PNG vs. JPEG Workflows:
+    PNG’s lossless compression allows bit-level edits with minimal artifacts.
+    JPEG’s lossy DCT-based compression distorts hidden data during conversions.
+
+
+Capacity Limits: Data size depends on image resolution/color depth.
+Small messages work well; larger ones risk visible distortions (1 bit ≈ 1 pixel/subpixel).
+
+1. Adaptive LSB Modification
+
+Analyzes image complexity in local 3x3 pixel regions
+Uses 1-3 LSBs per channel based on region complexity
+Hides more data in textured/complex areas (less noticeable)
+Preserves image quality in smooth areas
+
+2. DCT-based Steganography
+
+Operates in frequency domain using Discrete Cosine Transform
+Embeds data in mid-frequency DCT coefficients (less perceptible)
+Converts image to YCbCr color space and modifies Y channel
+More resistant to statistical analysis than spatial domain methods
 """
 
 import sys
 import os
-import io
-from PIL import Image, ExifTags  # Need to install: pip install pillow
+from PIL import Image, ExifTags
 from PIL.ExifTags import TAGS
-import numpy as np  # Need to install: pip install numpy
+import numpy as np
 from scipy.fftpack import dct, idct
-import reedsolo  # Need to install: pip install reedsolo
-import struct
-import zlib  # For CRC32 checksum
+
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QRadioButton, QGroupBox, QLineEdit, QPushButton, QComboBox,
-    QLabel, QTextEdit, QFileDialog, QStatusBar, QMessageBox
+    QLabel, QTextEdit, QFileDialog, QStatusBar, QMessageBox, QProgressBar
 )
 from PyQt6.QtGui import QPixmap
-from PyQt6.QtCore import Qt  # Need to install: pip install pyqt6
-import hashlib
-import random
+from PyQt6.QtCore import Qt
+from PyQt6.QtCore import QObject, pyqtSignal, QRunnable, QThreadPool
 
 debug_extract = True
 debug_embed = True
-debug_decode_encode = True
 debug_gui = True
 
-# Constants
-MAX_MESSAGE_SIZE = 100000  # Safety limit for message size in bits
-MAX_DCT_ALPHA = 25  # Increased strength for DCT embedding
 
-# Reed-Solomon error correction parameters
-RS_REDUNDANCY = 20  # Increased redundancy for better error correction
+class WorkerSignals(QObject):
+    finished = pyqtSignal()
+    progress = pyqtSignal(int)  # Percentage (0-100)
+    status = pyqtSignal(str)    # Text updates ("Encrypting...")
+    result = pyqtSignal(object) # Return value (e.g., output path)
 
+class Worker(QRunnable):
+    def __init__(self, fn, *args, **kwargs):
+        super().__init__()
+        self.fn = fn
+        self.args = args
+        self.kwargs = kwargs
+        self.signals = WorkerSignals()
 
-class CoordinateTracker:
-    """Track used DCT block coordinates"""
-    def __init__(self, max_coords):
-        self.used = set()
-        self.max_coords = max_coords
+    def run(self):
+        try:
+            self.signals.status.emit("Working... wait ...")
+            result = self.fn(*self.args, **self.kwargs)
+            self.signals.result.emit(result)
+        except Exception as e:
+            self.signals.status.emit(f"Error: {str(e)}")
+        finally:
+            self.signals.finished.emit()
 
-    def add(self, x, y):
-        if (x, y) in self.used or len(self.used) >= self.max_coords:
-            return False
-        self.used.add((x, y))
-        return True
-
-class StegaMaccina:
-    """ Handles embedding and extracting """
-    # Add to constants
-    DCT_SIZE = 8
-    ZIGZAG_ORDER = [
-        (0, 0), (0, 1), (1, 0), (2, 0), (1, 1), (0, 2), (0, 3), (1, 2),
-        (2, 1), (3, 0), (4, 0), (3, 1), (2, 2), (1, 3), (0, 4), (0, 5),
-        (1, 4), (2, 3), (3, 2), (4, 1), (5, 0), (6, 0), (5, 1), (4, 2),
-        (3, 3), (2, 4), (1, 5), (0, 6), (0, 7), (1, 6), (2, 5), (3, 4),
-        (4, 3), (5, 2), (6, 1), (7, 0), (7, 1), (6, 2), (5, 3), (4, 4),
-        (3, 5), (2, 6), (1, 7), (2, 7), (3, 6), (4, 5), (5, 4), (6, 3),
-        (7, 2), (7, 3), (6, 4), (5, 5), (4, 6), (3, 7), (4, 7), (5, 6),
-        (6, 5), (7, 4), (7, 5), (6, 6), (5, 7), (6, 7), (7, 6), (7, 7)
-    ]
+class StegaMachine:
+    START_CHAR = '#'  # Choose unique characters not likely to appear in the image or message
+    STOP_CHAR = '$'
 
     def __init__(self):
         pass
 
-    def is_mid_frequency(self, coeff_index):
-        """Check if coefficient is in mid-frequency range"""
-        return 5 < coeff_index < 58
+    # ------------------ Adaptive LSB Implementation ------------------
 
-    def quantize_coefficients(self, dct_block, quant_table):
-        """Quantize DCT coefficients using JPEG quantization table"""
-        return np.round(dct_block / quant_table)
+    def pixel_complexity(self, pixel_region):
+        """Calculate local complexity for adaptive LSB."""
+        # Calculate standard deviation as complexity measure
+        return np.std(pixel_region)
 
-    def crc32_checksum(self, data):
-        """Calculate CRC32 checksum for data verification."""
-        return zlib.crc32(data) & 0xffffffff
-
-    def text_to_rs_encoded(self, text, redundancy=RS_REDUNDANCY):
-        """Convert text to Reed-Solomon encoded bytes with checksum."""
-        # Initialize RS encoder
-        rs = reedsolo.RSCodec(redundancy)
-
-        # Convert text to bytes
-        text_bytes = text.encode('utf-8')
-
-        # Add checksum
-        checksum = struct.pack('>I', self.crc32_checksum(text_bytes))
-        data_with_checksum = checksum + text_bytes
-
-        # Encode with Reed-Solomon
-        encoded = rs.encode(data_with_checksum)
-
-        return encoded
-
-    def rs_encoded_to_text(self, encoded_data, redundancy=RS_REDUNDANCY):
-        """Convert Reed-Solomon encoded bytes back to text, with error correction and checksum verification."""
-        # Initialize RS decoder
-        rs = reedsolo.RSCodec(redundancy)
-
-        try:
-            # Decode data (this will correct errors up to the redundancy limit)
-            decoded, _, _ = rs.decode(encoded_data)
-
-            # Extract and verify checksum
-            if len(decoded) < 4:
-                if debug_decode_encode:
-                    print("Decoded data too short to contain checksum")
-                return None
-
-            stored_checksum = struct.unpack('>I', decoded[:4])[0]
-            text_bytes = decoded[4:]
-            calculated_checksum = self.crc32_checksum(text_bytes)
-
-            if stored_checksum != calculated_checksum:
-                if debug_decode_encode:
-                    print(f"Checksum verification failed: stored={stored_checksum}, calculated={calculated_checksum}")
-                return None
-
-            return text_bytes.decode('utf-8')
-        except reedsolo.ReedSolomonError as e:
-            if debug_decode_encode:
-                print(f"Reed-Solomon decoding error: {e}")
-            return None
-        except UnicodeDecodeError as e:
-            if debug_decode_encode:
-                print(f"Unicode decode error (possibly corrupted data): {e}")
-            return None
-
-    def bytes_to_binary_string(self, data):
-        """Convert bytes to a binary string with debug output."""
-        binary = ''.join(format(byte, '08b') for byte in data)
-        if debug_decode_encode:
-            print(f"Original Bytes: {data.hex()}")
-            print(f"Generated Binary: {binary[:64]}... (truncated)")
-        return ''.join([format(byte, '08b') for byte in data])
-
-    def binary_string_to_bytes(self, binary_string):
-        """Robust binary conversion with padding"""
-        # Pad with zeros to make length multiple of 8
-        padded = binary_string.ljust((len(binary_string) + 7) // 8 * 8, '0')
-        return bytes([int(padded[i:i + 8], 2) for i in range(0, len(padded), 8)])
-
-    # Better length encoding with redundancy and checksum
-    def encode_length_with_magic_marker(self, length):
-        """Encode length with strict validation and debug output"""
-        if length < 0 or length > MAX_MESSAGE_SIZE:
-            raise ValueError(f"Invalid length: {length}")
-
-        magic = 0xA55A
-        length_data = struct.pack('>HI', magic, length)
-        checksum = struct.pack('>I', self.crc32_checksum(length_data))
-
-        if debug_decode_encode:
-            print(f"Raw Length Data (hex): {length_data.hex()}{checksum.hex()}")
-
-        return self.bytes_to_binary_string(length_data + checksum) * 3
-
-    def decode_length_with_magic_marker(self,binary_data):
-        """Decode length with enhanced validation"""
-        bytes_data = self.binary_string_to_bytes(binary_data)
-
-        if debug_decode_encode:
-            print(f"Received Bytes (hex): {bytes_data.hex()}")
-            print(f"Total Bytes for Length: {len(bytes_data)} (needs at least 30)")
-
-        # Check all 3 copies of the 10-byte struct
-        for offset in [0, 10, 20]:
-            if offset + 10 > len(bytes_data):
-                continue
-
-            chunk = bytes_data[offset:offset + 10]
-            try:
-                magic, length = struct.unpack('>HI', chunk[:6])
-                stored_checksum = struct.unpack('>I', chunk[6:10])[0]
-                calculated_checksum = self.crc32_checksum(chunk[:6])
-
-                if debug_decode_encode:
-                    print(f"Checking chunk @ offset {offset}:")
-                    print(f"Magic: {magic:04X} (should be A55A)")
-                    print(f"Length: {length}")
-                    print(f"Checksum: stored={stored_checksum:08X}, calculated={calculated_checksum:08X}")
-
-                if magic == 0xA55A and stored_checksum == calculated_checksum:
-                    return min(length, MAX_MESSAGE_SIZE)
-            except Exception as e:
-                if debug_decode_encode:
-                    print(f"Chunk error @ {offset}: {str(e)}")
-                continue
-
-        return 0
+    def get_embedding_capacity(self, complexity, threshold_low=5, threshold_high=15):
+        # Determine number of LSBs to use based on complexity.
+        if complexity < threshold_low:
+            return 1  # Low complexity - use only 1 LSB
+        elif complexity < threshold_high:
+            return 2  # Medium complexity - use 2 LSBs
+        else:
+            return 3  # High complexity - use 3 LSBs
 
     def adaptive_lsb_embed(self, img, binary_message):
-        """Enhanced adaptive LSB algorithm focusing on stable areas."""
+        """Embeds a message using adaptive LSB steganography."""
         width, height = img.size
-        max_bits = ((width - 2) // 2) * ((height - 2) // 2) * 3  # 3 channels
-        if len(binary_message) > max_bits:
-            raise ValueError(f"Message too long: {len(binary_message)} > {max_bits} bits")
         pixels = np.array(img)
-        img_copy = img.copy()
+
+        # Prepare message index
         message_length = len(binary_message)
         data_index = 0
 
-        for y in range(1, height - 1, 2):
-            for x in range(1, width - 1, 2):
+        # Embed message
+        for x in range(0, width - 2, 3):
+            for y in range(0, height - 2, 3):
+                # Check if we've embedded the entire message
                 if data_index >= message_length:
                     break
 
-                region = pixels[max(0, y - 1):y + 2, max(0, x - 1):x + 2]
-                if np.var(region) < 100:
-                    pixel = list(img.getpixel((x, y)))
-                    for i in range(3):
+                # Get 3x3 pixel region for complexity analysis
+                region = pixels[y:y + 3, x:x + 3]
+                complexity = self.pixel_complexity(region)
+
+                # Determine embedding capacity
+                capacity = self.get_embedding_capacity(complexity)
+
+                # Embed in center pixel with determined capacity
+                pixel = list(img.getpixel((x + 1, y + 1)))
+
+                if debug_embed:
+                    print(f"Adaptive LSB embed Complexity: {complexity}")
+                    print(f"Adaptive LSB embed Capacity: {capacity}")
+                    print(f"Adaptive LSB embed Center pixel: {pixel}")
+
+
+                # For each color channel
+                for i in range(3):
+                    # Create bit mask based on capacity
+                    mask = (1 << capacity) - 1
+                    # Clear the LSBs
+                    pixel[i] = pixel[i] & ~mask
+
+                    # Embed bits
+                    bits_to_embed = 0
+                    for j in range(capacity):
                         if data_index < message_length:
-                            # Clear 2 LSBs and embed the same bit twice
-                            bit = int(binary_message[data_index])
-                            pixel[i] = (pixel[i] & ~3) | (bit << 1) | bit
+                            bits_to_embed |= int(binary_message[data_index], 2) << j
                             data_index += 1
-                    img_copy.putpixel((x, y), tuple(pixel))
+                    pixel[i] |= bits_to_embed
+                img.putpixel((x + 1, y + 1), tuple(pixel))
 
-        if debug_embed and data_index < len(binary_message):
-            print(f"EMBED FAILURE: Only embedded {data_index}/{len(binary_message)} bits")
-
-        return img_copy, data_index
-
-    def verify_length_embedding(self, img):
-        """Immediately verify the embedded length"""
-        length_info_size = len(self.encode_length_with_magic_marker(0))
-        extracted_binary = self.adaptive_lsb_extract(img, length_info_size)
-        # Pass the BINARY STRING directly to decoder
-        return self.decode_length_with_magic_marker(extracted_binary)  # NOT the bytes!
+        return img, data_index
 
     def adaptive_lsb_extract(self, img, message_length):
-        """Extract bits from smooth regions using first LSB."""
-        binary_message = []
+        """Extracts a message using adaptive LSB steganography."""
         width, height = img.size
+        pixels = np.array(img)
+        binary_message = ""
+        data_index = 0
 
-        for y in range(1, height - 1, 2):
-            for x in range(1, width - 1, 2):
-                if len(binary_message) >= message_length:
+        for x in range(0, width - 2, 3):
+            for y in range(0, height - 2, 3):
+                # Check if we've extracted enough bits
+                if data_index >= message_length:
                     break
 
-                pixel = img.getpixel((x, y))
-                # Extract only the first LSB (ignore redundancy)
-                for channel in pixel[:3]:  # RGB channels
-                    if len(binary_message) < message_length:
-                        binary_message.append(str((channel >> 1) & 1))  # Use first redundant bit
+                # Get 3x3 pixel region for complexity analysis
+                region = pixels[y:y + 3, x:x + 3]
+                complexity = self.pixel_complexity(region)
 
-        return ''.join(binary_message)
+                # Determine embedding capacity
+                capacity = self.get_embedding_capacity(complexity)
+
+                # Extract from center pixel
+                pixel = list(img.getpixel((x + 1, y + 1)))
+
+                # For each color channel
+                for i in range(3):
+                    # Extract bits
+                    for j in range(capacity):
+                        if data_index < message_length:
+                            bit = (pixel[i] >> j) & 1
+                            binary_message += str(bit)
+                            data_index += 1
+
+        if debug_extract:
+            print(f"Adaptive LSB extract Binary message: {binary_message}")
+
+        return binary_message
+
+    # ------------------ DCT Implementation ------------------
 
     def rgb_to_ycbcr(self, img):
         """Convert RGB image to YCbCr color space."""
@@ -290,47 +225,50 @@ class StegaMaccina:
 
         return rgb
 
-    def embed_in_dct_block(self, block, bits, alpha=MAX_DCT_ALPHA):
-        """Embed bits in carefully selected medium-frequency coefficients of an 8x8 DCT block."""
+    def embed_in_dct_block(self, block, bits, alpha=5):
+        """Embed bits in the mid-frequency coefficients of an 8x8 DCT block."""
         # Apply DCT
         dct_block = dct(dct(block.T, norm='ortho').T, norm='ortho')
 
-        # Use coefficients that are less affected by JPEG compression
-        # These are generally in the medium frequency range (not too low, not too high)
-        positions = [(3, 3), (4, 2), (2, 4), (3, 4), (4, 3), (5, 2), (2, 5)]  # Added more positions
+        # Mid-frequency coefficients to use (zigzag order)
+        positions = [(1, 2), (2, 1), (2, 2), (1, 3), (3, 1)]
 
         for i, pos in enumerate(positions):
             if i < len(bits):
-                # Use strong embedding with controlled quantization
-                coef_value = abs(dct_block[pos])
-                sign = 1 if dct_block[pos] >= 0 else -1
-
-                # Quantize coefficient based on bit
+                # Modify coefficient to embed bit
                 if bits[i] == '1':
-                    # Make it positive and large enough
-                    new_value = max(coef_value, alpha) if sign >= 0 else alpha
-                    dct_block[pos] = new_value
+                    # Ensure coefficient is positive and at least alpha
+                    if dct_block[pos] > 0:
+                        dct_block[pos] = max(dct_block[pos], alpha)
+                    else:
+                        dct_block[pos] = alpha
                 else:
-                    # Make it negative and large enough
-                    new_value = max(coef_value, alpha) if sign < 0 else alpha
-                    dct_block[pos] = -new_value
+                    # Ensure coefficient is negative and at most -alpha
+                    if dct_block[pos] < 0:
+                        dct_block[pos] = min(dct_block[pos], -alpha)
+                    else:
+                        dct_block[pos] = -alpha
 
-        # Apply inverse DCT with rounding to avoid floating point errors
+        # Apply inverse DCT
         idct_block = idct(idct(dct_block.T, norm='ortho').T, norm='ortho')
-        return np.round(idct_block).astype(np.float64)
+
+        if debug_embed:
+            print(f"Embed in DCT_block: {idct_block}")
+
+        return idct_block
 
     def extract_from_dct_block(self, block):
-        """Extract bits from the medium-frequency coefficients of an 8x8 DCT block."""
+        """Extract bits from the mid-frequency coefficients of an 8x8 DCT block."""
         # Apply DCT
         dct_block = dct(dct(block.T, norm='ortho').T, norm='ortho')
 
         # Same positions used for embedding
-        positions = [(3, 3), (4, 2), (2, 4), (3, 4), (4, 3), (5, 2), (2, 5)]  # Added more positions
+        positions = [(1, 2), (2, 1), (2, 2), (1, 3), (3, 1)]
         bits = ""
 
         for pos in positions:
             # Extract bit based on coefficient sign
-            if dct_block[pos] >= 0:
+            if dct_block[pos] > 0:
                 bits += '1'
             else:
                 bits += '0'
@@ -338,7 +276,7 @@ class StegaMaccina:
         return bits
 
     def dct_embed(self, img, binary_message):
-        """Embed message using improved DCT-based steganography with a focus on dark regions."""
+        """Embed message using DCT-based steganography."""
         # Convert to YCbCr
         ycbcr = self.rgb_to_ycbcr(img)
 
@@ -353,245 +291,216 @@ class StegaMaccina:
         message_length = len(binary_message)
         data_index = 0
 
-        # Define a threshold for dark regions
-        dark_threshold = 100  # Adjust this value based on your needs
-
-        # Process 8x8 blocks with spacing for resilience
+        # Process 8x8 blocks
         for y in range(0, height_pad, 8):
             for x in range(0, width_pad, 8):
                 if data_index >= message_length:
                     break
 
-                block = ycbcr[y:y + 8, x:x + 8, 0]  # Use Y channel
+                # Get the Y channel block
+                block = ycbcr[y:y + 8, x:x + 8, 0]
 
-                # Embed only in dark regions to minimize visual artifacts
-                if np.mean(block) < dark_threshold:
-                    bits = binary_message[data_index:data_index + 7]  # 7 bits per block
-                    if len(bits) < 7:
-                        bits = bits.ljust(7, '0')  # Pad if necessary
+                # Determine bits to embed in this block
+                bits_to_embed = binary_message[data_index:min(data_index + 5, message_length)]
+                data_index += len(bits_to_embed)
 
-                    modified_block = self.embed_in_dct_block(block, bits)
-                    ycbcr[y:y + 8, x:x + 8, 0] = modified_block
-                    data_index += 7
+                # Embed bits
+                modified_block = self.embed_in_dct_block(block, bits_to_embed)
+
+                # Update block
+                ycbcr[y:y + 8, x:x + 8, 0] = modified_block
 
         # Convert back to RGB
-        rgb_array = self.ycbcr_to_rgb(ycbcr)
-        result_img = Image.fromarray(rgb_array.astype(np.uint8))
-        return result_img, data_index
+        rgb = self.ycbcr_to_rgb(ycbcr)
 
-    def dct_extract(self, img, message_length, password=None):
-        """Improved DCT extraction with Java-inspired features"""
+        # Create new image
+        dct_img = Image.fromarray(rgb)
+        return dct_img, data_index
+
+    def dct_extract(self, img, message_length):
+        """Extract message using DCT-based steganography."""
+        # Convert to YCbCr
         ycbcr = self.rgb_to_ycbcr(img)
+
+        # Get image dimensions
         height, width, _ = ycbcr.shape
-        quant_table = np.array([
-            [16, 11, 10, 16, 24, 40, 51, 61],
-            [12, 12, 14, 19, 26, 58, 60, 55],
-            [14, 13, 16, 24, 40, 57, 69, 56],
-            [14, 17, 22, 29, 51, 87, 80, 62],
-            [18, 22, 37, 56, 68, 109, 103, 77],
-            [24, 35, 55, 64, 81, 104, 113, 92],
-            [49, 64, 78, 87, 103, 121, 120, 101],
-            [72, 92, 95, 98, 112, 100, 103, 99]
-        ])
 
-        # Initialize password-based random generator
-        seed = int(hashlib.sha256(password.encode()).hexdigest(), 16) & 0xffffffff if password else 0
-        rand = random.Random(seed)
+        # Ensure dimensions are multiples of 8
+        height_pad = height - (height % 8)
+        width_pad = width - (width % 8)
 
-        coord_tracker = CoordinateTracker((width * height) // (self.DCT_SIZE ** 2))
-        bits = []
+        # Prepare for extraction
+        binary_message = ""
+        bits_needed = message_length
 
-        while len(bits) < message_length:
-            # Find unused coordinates
-            while True:
-                xb = rand.randint(0, (width // self.DCT_SIZE) - 1)
-                yb = rand.randint(0, (height // self.DCT_SIZE) - 1)
-                if coord_tracker.add(xb, yb):
+        # Process 8x8 blocks
+        for y in range(0, height_pad, 8):
+            for x in range(0, width_pad, 8):
+                if len(binary_message) >= bits_needed:
                     break
 
-            # Extract block and convert to Y channel
-            block = ycbcr[yb * self.DCT_SIZE:(yb + 1) * self.DCT_SIZE, xb * self.DCT_SIZE:(xb + 1) * self.DCT_SIZE, 0]
-            block = block.astype(np.float64) - 128  # Center around zero
+                # Get the Y channel block
+                block = ycbcr[y:y + 8, x:x + 8, 0]
 
-            # Perform DCT
-            dct_block = dct(dct(block.T, norm='ortho').T, norm='ortho')
+                # Extract bits
+                bits = self.extract_from_dct_block(block)
 
-            # Quantize coefficients
-            quantized = self.quantize_coefficients(dct_block, quant_table)
+                # Add bits to message
+                remaining = bits_needed - len(binary_message)
+                binary_message += bits[:min(5, remaining)]
 
-            # Select random mid-frequency coefficient
-            while True:
-                coeff_index = rand.randint(1, len(self.ZIGZAG_ORDER) - 2)
-                if self.is_mid_frequency(coeff_index):
-                    i, j = self.ZIGZAG_ORDER[coeff_index]
-                    break
+        if debug_extract:
+            print(f"DCT Extract binary message first 30 bits {binary_message[:30]}")
 
-            # Extract LSB
-            bits.append(str(int(quantized[i, j]) & 1))
+        return binary_message
 
-            if len(bits) >= message_length:
-                break
+    # ------------------ Hybrid Steganography Functions ------------------
 
-        return ''.join(bits[:message_length])
-
-    def secure_hybrid_embed(self, image_path, message, start_char='#', stop_char='$'):
-        """Embeds a message into an image using improved hybrid steganography."""
+    def hybrid_embed_message(self, image_path, message, progress_callback=None):
+        """Embeds a message into an image, preserving original format when possible."""
         try:
             # Convert to absolute path
             abs_path = os.path.abspath(image_path)
             if not os.path.exists(abs_path):
                 raise FileNotFoundError(f"Image file not found at {abs_path}")
 
-            # Open image and get original format
             img = Image.open(abs_path)
-            original_format_to_save = img.format  # Save original format for later
-            original_format = img.format
+            img = img.convert("RGB")
 
-            # Convert to RGB if needed
-            if img.mode != "RGB":
-                img = img.convert("RGB")
+            if progress_callback:
+                progress_callback(10)
 
-            # Convert to PNG in-memory if original format is not PNG
-            if original_format.upper() != 'PNG':
-                png_buffer = io.BytesIO()
-                img.save(png_buffer, format='PNG')
-                png_buffer.seek(0)
-                img = Image.open(png_buffer)
-                original_format = 'PNG'  # Embedding is done on PNG version
-
-            # Add start and stop markers
-            full_message = start_char + message + stop_char
-
-            # Apply Reed-Solomon encoding
-            rs_encoded = self.text_to_rs_encoded(full_message)
-
-            # Convert to binary
-            binary_message = self.bytes_to_binary_string(rs_encoded)
+            # Process message and embed (existing code)
+            full_message = self.START_CHAR + message + self.STOP_CHAR
+            binary_message = ''.join(format(ord(char), '08b') for char in full_message)
             message_length = len(binary_message)
+            length_binary = format(message_length, '032b')
 
-            # Check if message is too large
-            if message_length > MAX_MESSAGE_SIZE:
-                raise ValueError(f"Message too large: {message_length} bits (max {MAX_MESSAGE_SIZE})")
-
-            # Create length information with redundancy and checksum
-            length_binary = self.encode_length_with_magic_marker(message_length)
-
-            # Embed length information using enhanced LSB
             img_copy = img.copy()
-            img_with_length, length_bits_embedded = self.adaptive_lsb_embed(img_copy, length_binary)
-
-            if length_bits_embedded < len(length_binary):
-                print(f"Warning: Could only embed {length_bits_embedded} of {len(length_binary)} length bits")
-
-            # Embed main message using improved DCT
+            img_with_length, _ = self.adaptive_lsb_embed(img_copy, length_binary)
             modified_img, embedded_bits = self.dct_embed(img_with_length, binary_message)
 
-            # Verify embedding success
+            if progress_callback:
+                progress_callback(50)
+
             if embedded_bits < message_length:
-                print(f"Warning: Could only embed {embedded_bits} of {message_length} bits")
+                raise ValueError("Could not embed entire message.")
 
-            # Verification step
-            verified_length = self.verify_length_embedding(img_with_length)
-            if verified_length != message_length:
-                raise RuntimeError(
-                    f"Length verification failed! "
-                    f"Embedded: {message_length}, Extracted: {verified_length}"
-                )
-
-            # Save in original format
+            # --- Enhanced Save Logic ---
             original_dir = os.path.dirname(abs_path)
             original_name = os.path.basename(abs_path)
-            base_name, ext = os.path.splitext(original_name)
-            modified_image_path = os.path.join(original_dir, f"encrypted_{base_name}{ext}")
+            base_name, original_ext = os.path.splitext(original_name)
+            original_ext = original_ext.lower()
 
-            # Use high quality settings for lossy formats
-            if original_format_to_save == "JPEG":
-                modified_img.save(modified_image_path, original_format_to_save, quality=100, subsampling=0)
+            if progress_callback:
+                progress_callback(70)
+
+            # Always embed to PNG first (temporary if original isn't PNG)
+            temp_png_path = os.path.join(original_dir, f"temp_embedded_{base_name}.png")
+            modified_img.save(temp_png_path, format='PNG')
+
+            # Case 1: Original is PNG -> Keep PNG output
+            if original_ext == '.png':
+                final_path = os.path.join(original_dir, f"encrypted_{base_name}.png")
+                os.replace(temp_png_path, final_path)  # Atomic rename
+                if progress_callback:
+                    progress_callback(100)
+                return final_path
+
+            # Case 2: Original is JPEG/BMP -> Convert back to original format
             else:
-                modified_img.save(modified_image_path, format='PNG')
+                final_path = os.path.join(original_dir, f"encrypted_{base_name}{original_ext}")
 
-            return modified_image_path
+                # High-quality conversion for JPEG
+                if original_ext in ('.jpg', '.jpeg'):
+                    Image.open(temp_png_path).save(
+                        final_path,
+                        format='JPEG',
+                        quality=95,  # Minimize compression artifacts
+                        subsampling=0  # 4:4:4 chroma (no subsampling)
+                    )
+                # Lossless conversion for other formats (BMP, etc.)
+                else:
+                    Image.open(temp_png_path).save(final_path, format=original_ext[1:].upper())
+
+                os.remove(temp_png_path)  # Clean up temporary PNG
+                if progress_callback:
+                    progress_callback(100)
+
+                return final_path
 
         except Exception as e:
-            print(f"Error in secure_hybrid_embed: {e}")
-            import traceback
-            traceback.print_exc()
+            # Clean up temp file if something failed
+            if 'temp_png_path' in locals() and os.path.exists(temp_png_path):
+                os.remove(temp_png_path)
+            raise e
+
+        except FileNotFoundError:
+            print(f"Error: Image file not found at {image_path}")
+            return None
+        except ValueError as e:
+            print(f"ValueError: {e}")
+            return None
+        except Exception as e:
+            print(f"An unexpected error occurred: {e}")
             return None
 
-    def secure_hybrid_extract(self, image_path, password=None, start_char='#', stop_char='$'):
-        """Updated extraction with password support"""
+    def hybrid_extract_message(self, image_path, progress_callback=None):
+        """Extracts a message from an image using the hybrid steganography method."""
         try:
-            img = Image.open(image_path).convert("RGB")
+            img = Image.open(image_path)
+            img = img.convert("RGB")
 
-            # Length extraction remains the same
-            length_info_size = len(self.encode_length_with_magic_marker(0))
-            length_binary = self.adaptive_lsb_extract(img, length_info_size * 2)
-            message_length = self.decode_length_with_magic_marker(length_binary)
+            # First extract the message length using Adaptive LSB
+            length_binary = self.adaptive_lsb_extract(img, 32)
+            message_length = int(length_binary, 2)
 
-            if debug_extract:
-                print(f"Length_info: {length_info_size}")
-                print(f"Length_binary: {length_binary}")
+            if progress_callback:
+                progress_callback(10)
 
-            # Decode the length with validation
-            message_length = self.decode_length_with_magic_marker(length_binary)
+            # Extract main message using DCT
+            binary_message = self.dct_extract(img, message_length)
 
-            if message_length <= 0 or message_length > MAX_MESSAGE_SIZE:
-                print(f"Invalid message length detected: {message_length}")
-                return None
+            if progress_callback:
+                progress_callback(30)  # After DCT extraction
 
-            if debug_extract:
-                print(f"Detected message length: {message_length} bits")
+            # Convert binary to characters
+            chars = []
+            for i in range(0, len(binary_message), 8):
+                byte = binary_message[i:i + 8]
+                if len(byte) == 8:  # Ensure we have a full byte
+                    chars.append(chr(int(byte, 2)))
+            extracted = ''.join(chars)
 
-            # Use new DCT extraction with password
-            binary_message = self.dct_extract(img, message_length, password)
-
-            # binary_message = dct_extract(img, message_length)
-            if len(binary_message) < message_length:
-                return f"ERROR: Only {len(binary_message)}/{message_length} bits extracted"
-
-            extracted_length = len(binary_message)
-            if extracted_length < message_length:
-                print(f"Warning: Could only extract {extracted_length} of {message_length} bits")
-                # Pad with zeros if needed
-                binary_message = binary_message.ljust(message_length, '0')
-
-            # Convert binary to bytes
-            encoded_bytes = self.binary_string_to_bytes(binary_message)
-
-            # Apply Reed-Solomon decoding with error correction
-            decoded_text = self.rs_encoded_to_text(encoded_bytes)
-            if not decoded_text:
-                print("Reed-Solomon decoding failed")
-                return None
+            if progress_callback:
+                progress_callback(50)
 
             # Find start and stop markers
-            start_index = decoded_text.find(start_char)
+            start_index = extracted.find(self.START_CHAR)
             if start_index == -1:
-                print("Start marker not found")
+                print("Start marker not found.")
                 return None
 
-            stop_index = decoded_text.find(stop_char, start_index + 1)
+            if progress_callback:
+                progress_callback(80)
+
+            stop_index = extracted.find(self.STOP_CHAR, start_index + 1)
             if stop_index == -1:
-                print("Stop marker not found")
+                print("Stop marker not found.")
                 return None
 
-            if not decoded_text:
-                print("Reed-Solomon decoding failed")
-                return "DECODING FAILED: Reed-Solomon error"
+            # Extract message between markers
 
-            # Find start and stop markers
-            start_index = decoded_text.find(start_char)
-            if start_index == -1:
-                return "MARKER ERROR: Start character not found"
+            if progress_callback:
+                progress_callback(100)
+            return extracted[start_index + 1:stop_index]
 
-            return decoded_text[start_index + 1:stop_index]
-
-        except Exception as e:
-            print(f"Error in secure_hybrid_extract: {e}")
-            import traceback
-            traceback.print_exc()
+        except FileNotFoundError:
+            print(f"Error: Image file not found at {image_path}")
             return None
-
+        except Exception as e:
+            print(f"An unexpected error occurred: {e}")
+            return None
 
 # ------------------------------------- The GUI part
 
@@ -638,12 +547,6 @@ class MainWindow(QMainWindow):
         path_layout.addWidget(self.browse_btn)
         layout.addLayout(path_layout)
 
-        self.password_label = QLabel("Password:")
-        self.password_input = QLineEdit()
-        self.password_input.setEchoMode(QLineEdit.EchoMode.Password)
-        layout.addWidget(self.password_label)
-        layout.addWidget(self.password_input)
-
         # Message input
         self.message_label = QLabel("Secret Message:")
         self.message_input = QLineEdit()
@@ -654,15 +557,34 @@ class MainWindow(QMainWindow):
         self.action_btn = QPushButton("Encrypt")
         layout.addWidget(self.action_btn)
 
-        # Preview area
+        # Preview area - modified with file info
         preview_layout = QHBoxLayout()
+
+        # Image preview (left side)
         self.preview_label = QLabel()
         self.preview_label.setFixedSize(400, 400)
         self.preview_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        preview_layout.addWidget(self.preview_label)
+
+        # Right side container (file info + EXIF)
+        right_layout = QVBoxLayout()
+
+        # File information group
+        file_info_group = QGroupBox("File Information")
+        file_info_layout = QVBoxLayout()
+        self.file_size_label = QLabel("Size: N/A")
+        self.file_type_label = QLabel("Type: N/A")
+        file_info_layout.addWidget(self.file_size_label)
+        file_info_layout.addWidget(self.file_type_label)
+        file_info_group.setLayout(file_info_layout)
+        right_layout.addWidget(file_info_group)
+
+        # EXIF data (existing)
         self.exif_text = QTextEdit()
         self.exif_text.setReadOnly(True)
-        preview_layout.addWidget(self.preview_label)
-        preview_layout.addWidget(self.exif_text)
+        right_layout.addWidget(self.exif_text)
+
+        preview_layout.addLayout(right_layout)
         layout.addLayout(preview_layout)
 
         # Status bar
@@ -674,6 +596,15 @@ class MainWindow(QMainWindow):
         self.browse_btn.clicked.connect(self.handle_browse)
         self.action_btn.clicked.connect(self.handle_action)
         self.file_radio.toggled.connect(self.update_path_field)
+
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setRange(0, 100)
+        self.progress_bar.setTextVisible(True)
+        # Add under progress bar setup
+        self.progress_label = QLabel("Ready")
+        layout.insertWidget(6, self.progress_label)
+        layout.addWidget(self.progress_bar)
+        self.threadpool = QThreadPool()  # Initialize thread pool
 
     def create_menu(self):
         menu_bar = self.menuBar()
@@ -718,16 +649,33 @@ class MainWindow(QMainWindow):
             elif self.decrypt_radio.isChecked():
                 self.update_preview(path)
 
+    # Update the update_preview() method:
     def update_preview(self, path):
         # Update image preview
         pixmap = QPixmap(path)
         if not pixmap.isNull():
             scaled = pixmap.scaled(400, 400, Qt.AspectRatioMode.KeepAspectRatio)
             self.preview_label.setPixmap(scaled)
+
+            # Update file info
+            try:
+                # File size
+                size_bytes = os.path.getsize(path)
+                size_kb = size_bytes / 1024
+                self.file_size_label.setText(f"Size: {size_kb:.2f} KB")
+
+                # File type
+                file_ext = os.path.splitext(path)[1].upper().replace('.', '') or 'Unknown'
+                self.file_type_label.setText(f"Type: {file_ext}")
+            except Exception as e:
+                self.file_size_label.setText("Size: Error")
+                self.file_type_label.setText("Type: Error")
         else:
             self.preview_label.clear()
+            self.file_size_label.setText("Size: N/A")
+            self.file_type_label.setText("Type: N/A")
 
-        # Update EXIF data
+        # Update EXIF data (existing)
         try:
             with Image.open(path) as img:
                 exif_info = self.get_exif_data(img)
@@ -762,8 +710,7 @@ class MainWindow(QMainWindow):
 
     def handle_encrypt(self):
         path = self.path_edit.text()
-        message = self.message_input.text().strip()  # Clean whitespace
-        password = self.password_input.text()
+        message = self.message_input.text()
 
         if not path:
             self.status_bar.showMessage("Please select an input file or folder!")
@@ -772,69 +719,109 @@ class MainWindow(QMainWindow):
             self.status_bar.showMessage("Message is required!")
             return
 
-        try:
-            if self.file_radio.isChecked():
-                if not os.path.exists(path):
-                    raise FileNotFoundError(f"File not found: {path}")
+        # Disable UI during operation
+        self.action_btn.setEnabled(False)
+        self.progress_bar.setValue(0)
 
-                output_path = machine.secure_hybrid_embed(path, message)
+        def on_progress(percent):
+            phases = {
+                5: "Starting...",
+                10: "Loading image...",
+                30: "Embedding LSB...",
+                50: "Embedding DCT...",
+                70: "Saving temporary file...",
+                90: "Final conversion...",
+                100: "Done"
+            }
+            self.progress_bar.setValue(percent)
+            self.progress_label.setText(phases.get(percent, "Working..."))
+            self.progress_bar.setValue(percent)
+            if percent == 100:
+                self.status_bar.showMessage("Encryption complete!")
+            elif percent == -1:
+                self.status_bar.showMessage("Encryption failed")
 
-                if not os.path.exists(output_path):
-                    raise RuntimeError(f"Failed to create output file at {output_path}")
-
-                # Verification phase
-                success_msg = (f"Encryption successful using\n"
-                               f"Original: {os.path.basename(path)}\n"
-                               f"Saved to: {os.path.basename(output_path)}")
-
-                try:
-                    decrypted = machine.secure_hybrid_extract(output_path)
-                    if decrypted is None:
-                        success_msg += "\n\nDecryption verification FAILED - No message found"
-                    elif decrypted != message:
-                        success_msg += (f"\n\nDECRYPTION MISMATCH!\n"
-                                        f"Original: {message}\n"
-                                        f"Decrypted: {decrypted}")
-                    else:
-                        success_msg += "\n\nDecryption verified - Message matches perfectly"
-                except Exception as e:
-                    success_msg += f"\n\nDecryption verification ERROR: {str(e)}"
-
-                # Show comprehensive result
-                QMessageBox.information(self, "Encryption Result", success_msg)
-                self.status_bar.showMessage(f"Saved encrypted file: {output_path}")
-
-                # Update preview
+        def on_result(output_path):
+            self.action_btn.setEnabled(True)
+            if output_path:
                 self.update_preview(output_path)
-            else:
-                self.process_folder(path, message)
+                QMessageBox.information(self, "Success",
+                                        f"Saved to {output_path}")
 
-        except FileNotFoundError as e:
-            error_msg = f"File not found: {str(e)}"
-            self.status_bar.showMessage(error_msg)
-            QMessageBox.critical(self, "Error", error_msg)
-        except Exception as e:
-            error_msg = f"Encryption Error: {str(e)}"
-            self.status_bar.showMessage(error_msg)
-            QMessageBox.critical(self, "Error", error_msg)
+        def on_error(e):
+            self.action_btn.setEnabled(True)
+            QMessageBox.critical(self, "Error", str(e))
+
+        # Create and start worker
+        worker = Worker(
+            lambda: machine.hybrid_embed_message(
+                path,
+                message,
+                progress_callback=on_progress
+            )
+        )
+        worker.signals.result.connect(on_result)
+        worker.signals.status.connect(self.status_bar.showMessage)
+        worker.signals.finished.connect(lambda: self.action_btn.setEnabled(True))
+        self.threadpool.start(worker)
+
+    def on_encrypt_finished(self, output_path):
+        self.action_btn.setEnabled(True)
+        self.update_preview(output_path)
+        QMessageBox.information(self, "Success", f"Saved to {output_path}")
+
 
     def handle_decrypt(self):
-        path = self.path_edit.text()
-        password = self.password_input.text()
+        path = self.path_edit.text()  # Get the input path from the UI
+        if not path:
+            self.status_bar.showMessage("Please select an input file or folder!")
+            return
 
-        try:
-            message = machine.secure_hybrid_extract(path, password)
+        # Disable UI during operation
+        self.action_btn.setEnabled(False)
+        self.progress_bar.setValue(0)  # Initialize progress bar
 
+        def on_progress(percent):
+            """Callback function to update the progress bar."""
+            phases = {
+                10: "Extracting length...",
+                30: "Analyzing DCT...",
+                50: "Decoding message...",
+                80: "Verifying markers...",
+                100: "Done"
+            }
+            self.progress_bar.setValue(percent)
+            self.progress_label.setText(phases.get(percent, "Processing..."))
+            self.progress_bar.setValue(percent)
+            if percent == 100:
+                self.status_bar.showMessage("Decryption complete!")
+            elif percent == -1:  # Error indicator
+                self.status_bar.showMessage("Decryption failed")
+
+        def on_result(message):
+            """Callback function to handle the decryption result."""
+            self.action_btn.setEnabled(True) # Re-enable UI
             if message:
                 QMessageBox.information(self, "Decrypted Message", message)
                 self.status_bar.showMessage("Message extracted successfully")
             else:
                 self.status_bar.showMessage("No message found or extraction failed")
                 QMessageBox.warning(self, "Warning", "No message found or extraction failed")
-        except Exception as e:
-            error_msg = f"Decryption Error: {str(e)}"
-            self.status_bar.showMessage(error_msg)
-            QMessageBox.critical(self, "Error", error_msg)
+
+        def on_error(e):
+            """Callback function to handle errors during decryption."""
+            self.action_btn.setEnabled(True) # Re-enable UI
+            self.status_bar.showMessage(f"Decryption Error: {str(e)}")
+            QMessageBox.critical(self, "Error", str(e))
+
+        # Create and start worker thread
+        worker = Worker(
+            lambda: machine.hybrid_extract_message(path, progress_callback=on_progress) # Pass the callback to the function
+        )
+        worker.signals.status.connect(self.status_bar.showMessage)  # Connect status signal
+        worker.signals.result.connect(on_result) #Connect result signal
+        worker.signals.finished.connect(lambda: self.action_btn.setEnabled(True)) # Re-enable UI when finished
+        self.threadpool.start(worker)
 
     def process_folder(self, folder_path, message):
         supported_ext = ('.png', '.jpg', '.jpeg', '.bmp')
@@ -845,20 +832,22 @@ class MainWindow(QMainWindow):
                 if file.lower().endswith(supported_ext):
                     file_path = os.path.join(root, file)
                     try:
-                        machine.secure_hybrid_embed(file_path, message)
+                        # Force output to PNG
+                        base_name = os.path.splitext(file)[0]
+                        output_path = os.path.join(root, f"encrypted_{base_name}.png")
+                        machine.hybrid_embed_message(file_path, message)
                         count += 1
                     except Exception as e:
-                        if debug_gui:
-                            print(f"Error processing {file}: {str(e)}")
+                        print(f"Error processing {file}: {str(e)}")
 
         self.status_bar.showMessage(f"Processed {count} files successfully")
 
     def show_help(self):
         help_text = """Steganography Tool Help
-
-Encryption Method:
-- DCT: Better for JPEGs, survives format conversions and resizing.
-- All types will be first converted to PNG and then repacked to original type.
+This tool will embed or extract message. New file will be
+named encrypted_[original filename]. Process will always save png file
+temporarily and convert file to jpg, jpeg or bmp if needed. This way
+embedding is not tampered with lossy formatting.
 
 Usage Tips:
 1. For encryption: Select file/folder, enter message, choose method
@@ -869,9 +858,8 @@ Usage Tips:
 Note: Always keep original files as some platforms may alter images"""
         QMessageBox.information(self, "Help", help_text)
 
-
 if __name__ == "__main__":
-    machine = StegaMaccina()
+    machine = StegaMachine()
     app = QApplication(sys.argv)
     window = MainWindow()
     window.show()
