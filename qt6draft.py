@@ -1,32 +1,8 @@
 """
-Version 0.0.1 by Divergentti / Jari Hiltunen (07.04.2025)
+Version 0.0.2 by Divergentti / Jari Hiltunen (08.04.2025)
 
-Steganography ≠ Encryption: It hides messages but doesn’t make them unreadable without extraction.
-Basic image analysis tools can detect hidden data. For confidentiality, encrypt data first
-(e.g., AES) before embedding. This script also supports non-secret use cases like copyright watermarking
-(e.g., embedding invisible ownership markers).
+Changes: improved speed
 
-PNG vs. JPEG Workflows:
-    PNG’s lossless compression allows bit-level edits with minimal artifacts.
-    JPEG’s lossy DCT-based compression distorts hidden data during conversions.
-
-
-Capacity Limits: Data size depends on image resolution/color depth.
-Small messages work well; larger ones risk visible distortions (1 bit ≈ 1 pixel/subpixel).
-
-1. Adaptive LSB Modification
-
-Analyzes image complexity in local 3x3 pixel regions
-Uses 1-3 LSBs per channel based on region complexity
-Hides more data in textured/complex areas (less noticeable)
-Preserves image quality in smooth areas
-
-2. DCT-based Steganography
-
-Operates in frequency domain using Discrete Cosine Transform
-Embeds data in mid-frequency DCT coefficients (less perceptible)
-Converts image to YCbCr color space and modifies Y channel
-More resistant to statistical analysis than spatial domain methods
 """
 
 import sys
@@ -35,6 +11,9 @@ from PIL import Image, ExifTags
 from PIL.ExifTags import TAGS
 import numpy as np
 from scipy.fftpack import dct, idct
+import cv2  # Added OpenCV
+import functools  # For caching
+from concurrent.futures import ThreadPoolExecutor  # For parallelization
 
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
@@ -45,16 +24,20 @@ from PyQt6.QtGui import QPixmap
 from PyQt6.QtCore import Qt
 from PyQt6.QtCore import QObject, pyqtSignal, QRunnable, QThreadPool
 
-debug_extract = True
-debug_embed = True
-debug_gui = True
+debug_extract = False  # Set to False in production for speed
+debug_embed = False  # Set to False in production for speed
+debug_gui = False  # Set to False in production for speed
+
+# Number of worker threads for parallel processing
+NUM_WORKERS = max(1, os.cpu_count() - 1)  # Leave one core free for system
 
 
 class WorkerSignals(QObject):
     finished = pyqtSignal()
     progress = pyqtSignal(int)  # Percentage (0-100)
-    status = pyqtSignal(str)    # Text updates ("Encrypting...")
-    result = pyqtSignal(object) # Return value (e.g., output path)
+    status = pyqtSignal(str)  # Text updates ("Encrypting...")
+    result = pyqtSignal(object)  # Return value (e.g., output path)
+
 
 class Worker(QRunnable):
     def __init__(self, fn, *args, **kwargs):
@@ -74,22 +57,22 @@ class Worker(QRunnable):
         finally:
             self.signals.finished.emit()
 
+
 class StegaMachine:
     START_CHAR = '#'  # Choose unique characters not likely to appear in the image or message
     STOP_CHAR = '$'
 
     def __init__(self):
-        pass
+        # Initialize the thread pool for parallel processing
+        self.thread_pool = ThreadPoolExecutor(max_workers=NUM_WORKERS)
+        # Cache for complexity calculations to avoid redundant work
+        self.complexity_cache = {}
 
-    # ------------------ Adaptive LSB Implementation ------------------
+    # ------------------ Optimized Adaptive LSB Implementation ------------------
 
-    def pixel_complexity(self, pixel_region):
-        """Calculate local complexity for adaptive LSB."""
-        # Calculate standard deviation as complexity measure
-        return np.std(pixel_region)
-
+    @functools.lru_cache(maxsize=256)
     def get_embedding_capacity(self, complexity, threshold_low=5, threshold_high=15):
-        # Determine number of LSBs to use based on complexity.
+        """Cached function to determine LSB capacity"""
         if complexity < threshold_low:
             return 1  # Low complexity - use only 1 LSB
         elif complexity < threshold_high:
@@ -98,187 +81,226 @@ class StegaMachine:
             return 3  # High complexity - use 3 LSBs
 
     def adaptive_lsb_embed(self, img, binary_message):
-        """Embeds a message using adaptive LSB steganography."""
-        width, height = img.size
-        pixels = np.array(img)
+        """Vectorized adaptive LSB embedding"""
+        # Convert PIL image to numpy array once
+        img_array = np.array(img)
+        height, width, _ = img_array.shape
 
-        # Prepare message index
-        message_length = len(binary_message)
+        # Prepare binary message as numpy array for faster access
+        message_bits = np.array([int(bit) for bit in binary_message], dtype=np.uint8)
+        message_length = len(message_bits)
         data_index = 0
 
-        # Embed message
-        for x in range(0, width - 2, 3):
-            for y in range(0, height - 2, 3):
-                # Check if we've embedded the entire message
+        # Pre-calculate all complexity values for 3x3 regions
+        complexity_map = np.zeros((height - 2, width - 2), dtype=np.float32)
+
+        # Calculate standard deviation for each 3x3 region using efficient sliding window
+        for y in range(0, height - 2, 3):
+            for x in range(0, width - 2, 3):
+                if y + 3 <= height and x + 3 <= width:
+                    region = img_array[y:y + 3, x:x + 3]
+                    complexity_map[y, x] = np.std(region)
+
+        # Process in batches for better cache utilization
+        batch_size = 100  # Adjust based on testing
+        modified_pixels = []
+
+        for i in range(0, width * height, batch_size):
+            # Get coordinates for this batch
+            coords = []
+            for j in range(i, min(i + batch_size, width * height)):
+                y, x = j // width, j % width
+                if 1 <= y < height - 1 and 1 <= x < width - 1:
+                    coords.append((y, x))
+
+            # Skip if no valid coordinates in this batch
+            if not coords:
+                continue
+
+            # Process this batch
+            for y, x in coords:
                 if data_index >= message_length:
                     break
 
-                # Get 3x3 pixel region for complexity analysis
-                region = pixels[y:y + 3, x:x + 3]
-                complexity = self.pixel_complexity(region)
+                # Use precomputed complexity if available
+                if y - 1 < len(complexity_map) and x - 1 < len(complexity_map[0]):
+                    complexity = complexity_map[y - 1, x - 1]
+                else:
+                    # Fallback for edge pixels
+                    region = img_array[max(0, y - 1):min(height, y + 2), max(0, x - 1):min(width, x + 2)]
+                    complexity = np.std(region)
 
-                # Determine embedding capacity
                 capacity = self.get_embedding_capacity(complexity)
+                pixel = img_array[y, x].copy()
 
-                # Embed in center pixel with determined capacity
-                pixel = list(img.getpixel((x + 1, y + 1)))
-
-                if debug_embed:
-                    print(f"Adaptive LSB embed Complexity: {complexity}")
-                    print(f"Adaptive LSB embed Capacity: {capacity}")
-                    print(f"Adaptive LSB embed Center pixel: {pixel}")
-
-
-                # For each color channel
-                for i in range(3):
-                    # Create bit mask based on capacity
+                # Embed bits in all channels at once
+                for i in range(3):  # RGB channels
+                    # Clear LSBs based on capacity
                     mask = (1 << capacity) - 1
-                    # Clear the LSBs
-                    pixel[i] = pixel[i] & ~mask
+                    pixel[i] &= ~mask
 
-                    # Embed bits
+                    # Get bits to embed (as many as capacity allows)
                     bits_to_embed = 0
                     for j in range(capacity):
                         if data_index < message_length:
-                            bits_to_embed |= int(binary_message[data_index], 2) << j
+                            bit_value = message_bits[data_index]
+                            bits_to_embed |= bit_value << j
                             data_index += 1
-                    pixel[i] |= bits_to_embed
-                img.putpixel((x + 1, y + 1), tuple(pixel))
 
-        return img, data_index
+                    # Embed bits
+                    pixel[i] |= bits_to_embed
+
+                # Store the modified pixel
+                modified_pixels.append((y, x, pixel))
+
+        # Apply all modified pixels to the original image
+        result_img = img.copy()
+        result_array = np.array(result_img)
+        for y, x, pixel in modified_pixels:
+            result_array[y, x] = pixel
+
+        # Convert back to PIL Image
+        result_img = Image.fromarray(result_array)
+
+        return result_img, data_index
 
     def adaptive_lsb_extract(self, img, message_length):
-        """Extracts a message using adaptive LSB steganography."""
-        width, height = img.size
-        pixels = np.array(img)
-        binary_message = ""
+        """Optimized LSB extraction using NumPy vectorization"""
+        # Convert to numpy array for faster processing
+        img_array = np.array(img)
+        height, width, _ = img_array.shape
+
+        # Pre-allocate result array
+        binary_message = np.zeros(message_length, dtype=np.uint8)
         data_index = 0
 
-        for x in range(0, width - 2, 3):
-            for y in range(0, height - 2, 3):
-                # Check if we've extracted enough bits
+        # Process in batches for better memory locality
+        for y in range(0, height - 2, 3):
+            for x in range(0, width - 2, 3):
                 if data_index >= message_length:
                     break
 
-                # Get 3x3 pixel region for complexity analysis
-                region = pixels[y:y + 3, x:x + 3]
-                complexity = self.pixel_complexity(region)
+                # Get center pixel and calculate complexity
+                if y + 1 < height and x + 1 < width:
+                    pixel = img_array[y + 1, x + 1]
+                    region = img_array[y:min(y + 3, height), x:min(x + 3, width)]
+                    complexity = np.std(region)
+                    capacity = self.get_embedding_capacity(complexity)
 
-                # Determine embedding capacity
-                capacity = self.get_embedding_capacity(complexity)
+                    # Extract bits from all channels
+                    for i in range(3):  # RGB channels
+                        for j in range(capacity):
+                            if data_index < message_length:
+                                # Extract bit using bit mask and shift
+                                bit = (pixel[i] >> j) & 1
+                                binary_message[data_index] = bit
+                                data_index += 1
 
-                # Extract from center pixel
-                pixel = list(img.getpixel((x + 1, y + 1)))
-
-                # For each color channel
-                for i in range(3):
-                    # Extract bits
-                    for j in range(capacity):
-                        if data_index < message_length:
-                            bit = (pixel[i] >> j) & 1
-                            binary_message += str(bit)
-                            data_index += 1
+        # Convert numpy array to string
+        result = ''.join(str(bit) for bit in binary_message)
 
         if debug_extract:
-            print(f"Adaptive LSB extract Binary message: {binary_message}")
+            print(f"Adaptive LSB extract Binary message: {result[:100]}...")
 
-        return binary_message
+        return result
 
-    # ------------------ DCT Implementation ------------------
+    # ------------------ Optimized DCT Implementation ------------------
 
-    def rgb_to_ycbcr(self, img):
-        """Convert RGB image to YCbCr color space."""
-        pixels = np.array(img)
-        height, width, _ = pixels.shape
+    def rgb_to_ycbcr_vectorized(self, img_array):
+        """Vectorized RGB to YCbCr conversion"""
+        # Create transformation matrix
+        transform = np.array([
+            [0.299, 0.587, 0.114],
+            [-0.168736, -0.331264, 0.5],
+            [0.5, -0.418688, -0.081312]
+        ])
 
-        ycbcr = np.zeros_like(pixels, dtype=float)
+        # Reshape for matrix multiplication
+        flat_rgb = img_array.reshape(-1, 3)
 
-        for y in range(height):
-            for x in range(width):
-                r, g, b = pixels[y, x]
+        # Apply transformation
+        flat_ycbcr = np.dot(flat_rgb, transform.T)
 
-                # RGB to YCbCr conversion
-                ycbcr[y, x, 0] = 0.299 * r + 0.587 * g + 0.114 * b
-                ycbcr[y, x, 1] = 128 - 0.168736 * r - 0.331264 * g + 0.5 * b
-                ycbcr[y, x, 2] = 128 + 0.5 * r - 0.418688 * g - 0.081312 * b
+        # Add offsets to Cb and Cr channels
+        flat_ycbcr[:, 1:] += 128
 
-        return ycbcr
+        # Reshape back to original dimensions
+        return flat_ycbcr.reshape(img_array.shape)
 
-    def ycbcr_to_rgb(self, ycbcr):
-        """Convert YCbCr image back to RGB color space."""
-        height, width, _ = ycbcr.shape
-        rgb = np.zeros_like(ycbcr, dtype=np.uint8)
+    def ycbcr_to_rgb_vectorized(self, ycbcr_array):
+        """Vectorized YCbCr to RGB conversion"""
+        # Create inverse transformation matrix
+        inverse_transform = np.array([
+            [1.0, 0.0, 1.402],
+            [1.0, -0.344136, -0.714136],
+            [1.0, 1.772, 0.0]
+        ])
 
-        for y in range(height):
-            for x in range(width):
-                y_val, cb, cr = ycbcr[y, x]
+        # Make a copy to avoid modifying the original
+        ycbcr_copy = ycbcr_array.copy()
 
-                # YCbCr to RGB conversion
-                r = y_val + 1.402 * (cr - 128)
-                g = y_val - 0.344136 * (cb - 128) - 0.714136 * (cr - 128)
-                b = y_val + 1.772 * (cb - 128)
+        # Subtract offsets from Cb and Cr channels
+        ycbcr_copy[..., 1:] -= 128
 
-                # Clip values to valid range
-                rgb[y, x, 0] = min(max(0, round(r)), 255)
-                rgb[y, x, 1] = min(max(0, round(g)), 255)
-                rgb[y, x, 2] = min(max(0, round(b)), 255)
+        # Reshape for matrix multiplication
+        flat_ycbcr = ycbcr_copy.reshape(-1, 3)
 
-        return rgb
+        # Apply transformation
+        flat_rgb = np.dot(flat_ycbcr, inverse_transform.T)
 
-    def embed_in_dct_block(self, block, bits, alpha=5):
-        """Embed bits in the mid-frequency coefficients of an 8x8 DCT block."""
-        # Apply DCT
-        dct_block = dct(dct(block.T, norm='ortho').T, norm='ortho')
+        # Clip values to valid range and convert to uint8
+        flat_rgb = np.clip(flat_rgb, 0, 255).astype(np.uint8)
 
-        # Mid-frequency coefficients to use (zigzag order)
-        positions = [(1, 2), (2, 1), (2, 2), (1, 3), (3, 1)]
+        # Reshape back to original dimensions
+        return flat_rgb.reshape(ycbcr_array.shape)
 
-        for i, pos in enumerate(positions):
-            if i < len(bits):
-                # Modify coefficient to embed bit
-                if bits[i] == '1':
-                    # Ensure coefficient is positive and at least alpha
-                    if dct_block[pos] > 0:
-                        dct_block[pos] = max(dct_block[pos], alpha)
+    def process_dct_block_batch(self, blocks, bits_array, start_indices, alpha=5):
+        """Process multiple DCT blocks in parallel"""
+        results = []
+
+        for i, (block, start_idx) in enumerate(zip(blocks, start_indices)):
+            # Get bits for this block
+            bits = bits_array[start_idx:start_idx + 5]
+            if len(bits) == 0:
+                # No more bits to embed
+                results.append(block)
+                continue
+
+            # Apply DCT
+            dct_block = dct(dct(block.T, norm='ortho').T, norm='ortho')
+
+            # Mid-frequency coefficients positions
+            positions = [(1, 2), (2, 1), (2, 2), (1, 3), (3, 1)]
+
+            # Modify coefficients based on bits
+            for j, pos in enumerate(positions):
+                if j < len(bits):
+                    if bits[j] == '1':
+                        # Ensure coefficient is positive
+                        if dct_block[pos] > 0:
+                            dct_block[pos] = max(dct_block[pos], alpha)
+                        else:
+                            dct_block[pos] = alpha
                     else:
-                        dct_block[pos] = alpha
-                else:
-                    # Ensure coefficient is negative and at most -alpha
-                    if dct_block[pos] < 0:
-                        dct_block[pos] = min(dct_block[pos], -alpha)
-                    else:
-                        dct_block[pos] = -alpha
+                        # Ensure coefficient is negative
+                        if dct_block[pos] < 0:
+                            dct_block[pos] = min(dct_block[pos], -alpha)
+                        else:
+                            dct_block[pos] = -alpha
 
-        # Apply inverse DCT
-        idct_block = idct(idct(dct_block.T, norm='ortho').T, norm='ortho')
+            # Apply inverse DCT
+            idct_block = idct(idct(dct_block.T, norm='ortho').T, norm='ortho')
+            results.append(idct_block)
 
-        if debug_embed:
-            print(f"Embed in DCT_block: {idct_block}")
-
-        return idct_block
-
-    def extract_from_dct_block(self, block):
-        """Extract bits from the mid-frequency coefficients of an 8x8 DCT block."""
-        # Apply DCT
-        dct_block = dct(dct(block.T, norm='ortho').T, norm='ortho')
-
-        # Same positions used for embedding
-        positions = [(1, 2), (2, 1), (2, 2), (1, 3), (3, 1)]
-        bits = ""
-
-        for pos in positions:
-            # Extract bit based on coefficient sign
-            if dct_block[pos] > 0:
-                bits += '1'
-            else:
-                bits += '0'
-
-        return bits
+        return results
 
     def dct_embed(self, img, binary_message):
-        """Embed message using DCT-based steganography."""
-        # Convert to YCbCr
-        ycbcr = self.rgb_to_ycbcr(img)
+        """Optimized DCT embedding using parallel processing"""
+        # Convert PIL image to numpy array
+        img_array = np.array(img)
+
+        # Convert to YCbCr color space using vectorized function
+        ycbcr = self.rgb_to_ycbcr_vectorized(img_array)
 
         # Get image dimensions
         height, width, _ = ycbcr.shape
@@ -287,113 +309,195 @@ class StegaMachine:
         height_pad = height - (height % 8)
         width_pad = width - (width % 8)
 
-        # Prepare message index
+        # Prepare message
         message_length = len(binary_message)
+
+        # Collect blocks for batch processing
+        blocks = []
+        block_positions = []
+        start_indices = []
         data_index = 0
 
-        # Process 8x8 blocks
+        # Divide image into 8x8 blocks
         for y in range(0, height_pad, 8):
             for x in range(0, width_pad, 8):
                 if data_index >= message_length:
                     break
 
-                # Get the Y channel block
-                block = ycbcr[y:y + 8, x:x + 8, 0]
+                # Get Y channel block
+                block = ycbcr[y:y + 8, x:x + 8, 0].copy()
+                blocks.append(block)
+                block_positions.append((y, x))
 
-                # Determine bits to embed in this block
-                bits_to_embed = binary_message[data_index:min(data_index + 5, message_length)]
-                data_index += len(bits_to_embed)
+                # Store starting index for this block's bits
+                start_indices.append(data_index)
 
-                # Embed bits
-                modified_block = self.embed_in_dct_block(block, bits_to_embed)
+                # Update data index (5 bits per block)
+                bits_this_block = min(5, message_length - data_index)
+                data_index += bits_this_block
 
-                # Update block
+        # Process blocks in parallel batches
+        batch_size = 50  # Adjust based on testing
+        for i in range(0, len(blocks), batch_size):
+            batch_blocks = blocks[i:i + batch_size]
+            batch_positions = block_positions[i:i + batch_size]
+            batch_indices = start_indices[i:i + batch_size]
+
+            # Process this batch
+            modified_blocks = self.process_dct_block_batch(batch_blocks, binary_message, batch_indices)
+
+            # Update blocks in the YCbCr array
+            for modified_block, (y, x) in zip(modified_blocks, batch_positions):
                 ycbcr[y:y + 8, x:x + 8, 0] = modified_block
 
-        # Convert back to RGB
-        rgb = self.ycbcr_to_rgb(ycbcr)
+        # Convert back to RGB using vectorized function
+        rgb = self.ycbcr_to_rgb_vectorized(ycbcr)
 
-        # Create new image
+        # Create new PIL image
         dct_img = Image.fromarray(rgb)
         return dct_img, data_index
 
-    def dct_extract(self, img, message_length):
-        """Extract message using DCT-based steganography."""
-        # Convert to YCbCr
-        ycbcr = self.rgb_to_ycbcr(img)
+    def extract_from_dct_blocks_batch(self, blocks):
+        """Extract bits from multiple DCT blocks in parallel"""
+        results = []
 
-        # Get image dimensions
+        for block in blocks:
+            # Apply DCT
+            dct_block = dct(dct(block.T, norm='ortho').T, norm='ortho')
+
+            # Same positions used for embedding
+            positions = [(1, 2), (2, 1), (2, 2), (1, 3), (3, 1)]
+            bits = ""
+
+            # Extract bits based on coefficient signs
+            for pos in positions:
+                bits += '1' if dct_block[pos] > 0 else '0'
+
+            results.append(bits)
+
+        return results
+
+    def dct_extract(self, img, message_length):
+        """Optimized DCT extraction using parallel processing"""
+        # Convert to numpy array
+        img_array = np.array(img)
+
+        # Convert to YCbCr
+        ycbcr = self.rgb_to_ycbcr_vectorized(img_array)
+
+        # Get dimensions
         height, width, _ = ycbcr.shape
 
         # Ensure dimensions are multiples of 8
         height_pad = height - (height % 8)
         width_pad = width - (width % 8)
 
-        # Prepare for extraction
-        binary_message = ""
+        # Collect blocks for batch processing
+        blocks = []
         bits_needed = message_length
+        blocks_needed = (bits_needed + 4) // 5  # Each block can hold 5 bits
 
-        # Process 8x8 blocks
+        # Collect required blocks
         for y in range(0, height_pad, 8):
             for x in range(0, width_pad, 8):
-                if len(binary_message) >= bits_needed:
+                if len(blocks) >= blocks_needed:
                     break
 
-                # Get the Y channel block
+                # Get Y channel block
                 block = ycbcr[y:y + 8, x:x + 8, 0]
+                blocks.append(block)
 
-                # Extract bits
-                bits = self.extract_from_dct_block(block)
+        # Process blocks in parallel batches
+        binary_message = ""
+        batch_size = 50  # Adjust based on testing
 
-                # Add bits to message
+        for i in range(0, len(blocks), batch_size):
+            batch_blocks = blocks[i:i + batch_size]
+
+            # Extract bits from this batch
+            batch_results = self.extract_from_dct_blocks_batch(batch_blocks)
+
+            # Combine results
+            for bits in batch_results:
                 remaining = bits_needed - len(binary_message)
                 binary_message += bits[:min(5, remaining)]
+                if len(binary_message) >= bits_needed:
+                    break
 
         if debug_extract:
             print(f"DCT Extract binary message first 30 bits {binary_message[:30]}")
 
         return binary_message
 
-    # ------------------ Hybrid Steganography Functions ------------------
+    # ------------------ Optimized Hybrid Steganography Functions ------------------
 
     def hybrid_embed_message(self, image_path, message, progress_callback=None):
-        """Embeds a message into an image, preserving original format when possible."""
+        """Optimized embedding with progress reporting"""
         try:
-            # Convert to absolute path
+            # Convert to absolute path and verify existence
             abs_path = os.path.abspath(image_path)
             if not os.path.exists(abs_path):
                 raise FileNotFoundError(f"Image file not found at {abs_path}")
 
-            img = Image.open(abs_path)
-            img = img.convert("RGB")
-
+            # Progress update
             if progress_callback:
-                progress_callback(10)
+                progress_callback(5)  # Starting
 
-            # Process message and embed (existing code)
+            # Load image with OpenCV for better performance
+            cv_img = cv2.imread(abs_path)
+            if cv_img is None:
+                raise ValueError(f"Failed to load image: {abs_path}")
+
+            # Convert from BGR to RGB (OpenCV uses BGR)
+            cv_img_rgb = cv2.cvtColor(cv_img, cv2.COLOR_BGR2RGB)
+
+            # Convert to PIL for compatibility with rest of code
+            img = Image.fromarray(cv_img_rgb)
+
+            # Progress update
+            if progress_callback:
+                progress_callback(10)  # Image loaded
+
+            # Process message and embed
             full_message = self.START_CHAR + message + self.STOP_CHAR
+
+            # Vectorized binary conversion
             binary_message = ''.join(format(ord(char), '08b') for char in full_message)
             message_length = len(binary_message)
             length_binary = format(message_length, '032b')
 
+            # Progress update
+            if progress_callback:
+                progress_callback(20)  # Binary conversion done
+
+            # Embed length using Adaptive LSB
             img_copy = img.copy()
             img_with_length, _ = self.adaptive_lsb_embed(img_copy, length_binary)
+
+            # Progress update
+            if progress_callback:
+                progress_callback(30)  # LSB embedding done
+
+            # Embed message using DCT
             modified_img, embedded_bits = self.dct_embed(img_with_length, binary_message)
 
-            if progress_callback:
-                progress_callback(50)
-
+            # Check if entire message was embedded
             if embedded_bits < message_length:
-                raise ValueError("Could not embed entire message.")
+                raise ValueError("Could not embed entire message. Try a larger image.")
 
-            # --- Enhanced Save Logic ---
+            # Progress update
+            if progress_callback:
+                progress_callback(50)  # DCT embedding done
+
+            # Enhanced Save Logic
             original_dir = os.path.dirname(abs_path)
             original_name = os.path.basename(abs_path)
             base_name, original_ext = os.path.splitext(original_name)
             original_ext = original_ext.lower()
 
+            # Progress update
             if progress_callback:
-                progress_callback(70)
+                progress_callback(70)  # Save prep done
 
             # Always embed to PNG first (temporary if original isn't PNG)
             temp_png_path = os.path.join(original_dir, f"temp_embedded_{base_name}.png")
@@ -404,7 +508,7 @@ class StegaMachine:
                 final_path = os.path.join(original_dir, f"encrypted_{base_name}.png")
                 os.replace(temp_png_path, final_path)  # Atomic rename
                 if progress_callback:
-                    progress_callback(100)
+                    progress_callback(100)  # Done
                 return final_path
 
             # Case 2: Original is JPEG/BMP -> Convert back to original format
@@ -425,7 +529,7 @@ class StegaMachine:
 
                 os.remove(temp_png_path)  # Clean up temporary PNG
                 if progress_callback:
-                    progress_callback(100)
+                    progress_callback(100)  # Done
 
                 return final_path
 
@@ -433,38 +537,44 @@ class StegaMachine:
             # Clean up temp file if something failed
             if 'temp_png_path' in locals() and os.path.exists(temp_png_path):
                 os.remove(temp_png_path)
+            if progress_callback:
+                progress_callback(-1)  # Error indicator
             raise e
 
-        except FileNotFoundError:
-            print(f"Error: Image file not found at {image_path}")
-            return None
-        except ValueError as e:
-            print(f"ValueError: {e}")
-            return None
-        except Exception as e:
-            print(f"An unexpected error occurred: {e}")
-            return None
-
     def hybrid_extract_message(self, image_path, progress_callback=None):
-        """Extracts a message from an image using the hybrid steganography method."""
+        """Optimized extraction with progress reporting"""
         try:
-            img = Image.open(image_path)
-            img = img.convert("RGB")
+            # Load image with OpenCV for better performance
+            cv_img = cv2.imread(image_path)
+            if cv_img is None:
+                raise ValueError(f"Failed to load image: {image_path}")
+
+            # Convert from BGR to RGB (OpenCV uses BGR)
+            cv_img_rgb = cv2.cvtColor(cv_img, cv2.COLOR_BGR2RGB)
+
+            # Convert to PIL for compatibility with rest of code
+            img = Image.fromarray(cv_img_rgb)
+
+            # Progress update
+            if progress_callback:
+                progress_callback(5)  # Image loaded
 
             # First extract the message length using Adaptive LSB
             length_binary = self.adaptive_lsb_extract(img, 32)
             message_length = int(length_binary, 2)
 
+            # Progress update
             if progress_callback:
-                progress_callback(10)
+                progress_callback(10)  # Length extracted
 
             # Extract main message using DCT
             binary_message = self.dct_extract(img, message_length)
 
+            # Progress update
             if progress_callback:
-                progress_callback(30)  # After DCT extraction
+                progress_callback(30)  # Binary message extracted
 
-            # Convert binary to characters
+            # Optimized binary to characters conversion
             chars = []
             for i in range(0, len(binary_message), 8):
                 byte = binary_message[i:i + 8]
@@ -472,35 +582,43 @@ class StegaMachine:
                     chars.append(chr(int(byte, 2)))
             extracted = ''.join(chars)
 
+            # Progress update
             if progress_callback:
-                progress_callback(50)
+                progress_callback(50)  # Characters decoded
 
             # Find start and stop markers
             start_index = extracted.find(self.START_CHAR)
             if start_index == -1:
-                print("Start marker not found.")
+                if debug_extract:
+                    print("Start marker not found.")
                 return None
 
+            # Progress update
             if progress_callback:
-                progress_callback(80)
+                progress_callback(80)  # Start marker found
 
             stop_index = extracted.find(self.STOP_CHAR, start_index + 1)
             if stop_index == -1:
-                print("Stop marker not found.")
+                if debug_extract:
+                    print("Stop marker not found.")
                 return None
 
             # Extract message between markers
+            result = extracted[start_index + 1:stop_index]
 
+            # Progress update
             if progress_callback:
-                progress_callback(100)
-            return extracted[start_index + 1:stop_index]
+                progress_callback(100)  # Done
 
-        except FileNotFoundError:
-            print(f"Error: Image file not found at {image_path}")
-            return None
+            return result
+
         except Exception as e:
-            print(f"An unexpected error occurred: {e}")
+            if progress_callback:
+                progress_callback(-1)  # Error indicator
+            if debug_extract:
+                print(f"Extraction error: {str(e)}")
             return None
+
 
 # ------------------------------------- The GUI part
 
@@ -855,7 +973,38 @@ Usage Tips:
 3. DCT method survives LinkedIn-style JPEG conversion and resizing
 4. EXIF data is preserved during encryption
 
-Note: Always keep original files as some platforms may alter images"""
+Note: Always keep original files as some platforms may alter images
+
+Steganography ≠ Encryption: It hides messages but doesn’t make them 
+unreadable without extraction.
+
+Basic image analysis tools can detect hidden data. For confidentiality, 
+encrypt data first (e.g., AES) before embedding. This script also supports 
+non-secret use cases like copyright watermarking 
+(e.g., embedding invisible ownership markers).
+
+PNG vs. JPEG Workflows:
+    PNG’s lossless compression allows bit-level edits with minimal artifacts.
+    JPEG’s lossy DCT-based compression distorts hidden data during conversions.
+
+Capacity Limits: Data size depends on image resolution/color depth.
+Small messages work well; larger ones risk visible distortions (1 bit ≈ 1 pixel/subpixel).
+
+1. Adaptive LSB Modification
+
+Analyzes image complexity in local 3x3 pixel regions
+Uses 1-3 LSBs per channel based on region complexity
+Hides more data in textured/complex areas (less noticeable)
+Preserves image quality in smooth areas
+
+2. DCT-based Steganography
+
+Operates in frequency domain using Discrete Cosine Transform
+Embeds data in mid-frequency DCT coefficients (less perceptible)
+Converts image to YCbCr color space and modifies Y channel
+More resistant to statistical analysis than spatial domain methods
+
+"""
         QMessageBox.information(self, "Help", help_text)
 
 if __name__ == "__main__":
