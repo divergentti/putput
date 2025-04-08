@@ -40,6 +40,8 @@ Notes
     🎓 Learning steganography techniques.
     🏗 Lightweight Python (no heavy dependencies).
 
+Latest code with GUI at https://github.com/divergentti/steganography/tree/main
+
 **2. 2xLLM-blaa-blaa.py**
 
 Make two LLMs chat with each other—one local (e.g., via LM Studio), the other via Mistral.ai API.
