@@ -17,11 +17,11 @@ from TTS.tts.configs.xtts_config import XttsConfig
 from TTS.tts.models.xtts import Xtts
 
 # Configuration constants
-CONFIG_PATH = "/home/jari/PycharmProjects/TTS/models/xtts2/config.json"
-CHECKPOINT_DIR = "/home/jari/PycharmProjects/TTS/models/xtts2/"
+CONFIG_PATH = "./models/xtts2/config.json"
+CHECKPOINT_DIR = "./models/xtts2/"
 SPEAKER_WAV = "small.wav"  # Reference audio for voice cloning
 TEXT_FILE = "text_to_be_spoken.txt"
-OUTPUT_DIR = "/home/jari/PycharmProjects/TTS/Jari/tts_output"
+OUTPUT_DIR = "./tts_output"
 OUTPUT_FILE = "combined_audio.wav"
 MAX_CHUNK_LENGTH = 240  # Optimal chunk size for XTTS2 (characters)
 SILENCE_THRESHOLD = -40  # dBFS for silence removal
