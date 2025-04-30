@@ -15,7 +15,7 @@ CHECKPOINT_DIR = "./models/xtts2/"
 SPEAKER_WAV = "small.wav"
 TEXT_FILE = "text_to_be_spoken.txt"
 OUTPUT_DIR = "./tts_output"
-MAX_CHUNK_LENGTH = 250
+MAX_CHUNK_LENGTH = 240
 
 
 def clean_text(text):
@@ -25,26 +25,37 @@ def clean_text(text):
 
 
 def split_text(text, max_length=250):
+    # Split into sentences first (better than regex)
     sentences = nltk.sent_tokenize(text)
-    chunks, current_chunk, current_len = [], [], 0
-    for sentence in sentences:
-        sentence_len = len(sentence)
-        if current_len + sentence_len > max_length:
-            if current_chunk:
-                chunks.append(" ".join(current_chunk))
-                current_chunk, current_len = [], 0
-            # Handle sentences longer than max_length
-            while sentence_len > max_length:
-                split_index = sentence[:max_length].rfind(' ')
-                chunks.append(sentence[:split_index])
-                sentence = sentence[split_index+1:]
-                sentence_len = len(sentence)
-        current_chunk.append(sentence)
-        current_len += sentence_len
-    if current_chunk:
-        chunks.append(" ".join(current_chunk))
-    return chunks
+    chunks = []
+    current_chunk = ""
 
+    for sentence in sentences:
+        # If adding the sentence exceeds max_length
+        if len(current_chunk) + len(sentence) > max_length:
+            if current_chunk:  # Save existing chunk
+                chunks.append(current_chunk.strip())
+                current_chunk = ""
+
+            # If the sentence itself is too long, split on commas/words
+            while len(sentence) > max_length:
+                # Try to split at last comma in first `max_length` chars
+                split_pos = sentence[:max_length].rfind(', ')
+                if split_pos == -1:  # No comma? Split at space
+                    split_pos = sentence[:max_length].rfind(' ')
+
+                if split_pos == -1:  # No space? Hard split
+                    split_pos = max_length - 1
+
+                chunks.append(sentence[:split_pos].strip())
+                sentence = sentence[split_pos + 1:]  # Remaining text
+
+        current_chunk += sentence + " "
+
+    if current_chunk.strip():
+        chunks.append(current_chunk.strip())
+
+    return chunks
 
 print("🔄 Ladataan XTTS2-malli...")
 config = XttsConfig()
@@ -68,7 +79,11 @@ chunks = split_text(cleaned_text, MAX_CHUNK_LENGTH)
 
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
+
 for i, chunk in enumerate(chunks, 1):
+    if len(chunk) > 250:
+        print(f"⚠️ Chunk {i} is too long ({len(chunk)} chars). Truncating...")
+        chunk = chunk[:250]  # Hard truncate as fallback
     print(f"🎙 Generoidaan osa {i}/{len(chunks)}...")
 
     out = model.inference(
