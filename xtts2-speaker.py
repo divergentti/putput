@@ -5,32 +5,44 @@ import torchaudio
 
 from TTS.tts.configs.xtts_config import XttsConfig
 from TTS.tts.models.xtts import Xtts
+from nltk.tokenize import sent_tokenize
+import nltk
+nltk.download('punkt')
+
 
 CONFIG_PATH = "./models/xtts2/config.json"
 CHECKPOINT_DIR = "./models/xtts2/"
 SPEAKER_WAV = "small.wav"
 TEXT_FILE = "text_to_be_spoken.txt"
 OUTPUT_DIR = "./tts_output"
-MAX_CHUNK_LENGTH = 249
+MAX_CHUNK_LENGTH = 250
 
 
 def clean_text(text):
-    text = re.sub(r'\s+', ' ', text)
-    text = re.sub(r'[^A-Za-z0-9 .,!?\'"-]', '', text)
+    text = re.sub(r'\s+', ' ', text)  # Replace multiple spaces with one
+    text = re.sub(r'[^A-Za-z0-9 .,!?\'"\-:;()…]', '', text)  # Keep essential punctuation
     return text.strip()
 
 
-def split_text(text, max_length=249):
-    sentences = re.split(r'(?<=[.!?]) +', text)
-    chunks, current_chunk = [], ""
+def split_text(text, max_length=250):
+    sentences = nltk.sent_tokenize(text)
+    chunks, current_chunk, current_len = [], [], 0
     for sentence in sentences:
-        if len(current_chunk) + len(sentence) <= max_length:
-            current_chunk += sentence + " "
-        else:
-            chunks.append(current_chunk.strip())
-            current_chunk = sentence + " "
+        sentence_len = len(sentence)
+        if current_len + sentence_len > max_length:
+            if current_chunk:
+                chunks.append(" ".join(current_chunk))
+                current_chunk, current_len = [], 0
+            # Handle sentences longer than max_length
+            while sentence_len > max_length:
+                split_index = sentence[:max_length].rfind(' ')
+                chunks.append(sentence[:split_index])
+                sentence = sentence[split_index+1:]
+                sentence_len = len(sentence)
+        current_chunk.append(sentence)
+        current_len += sentence_len
     if current_chunk:
-        chunks.append(current_chunk.strip())
+        chunks.append(" ".join(current_chunk))
     return chunks
 
 
