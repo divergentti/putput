@@ -1,9 +1,6 @@
 #!/usr/bin/env python3
 """
-XTTS2 Batch Text-to-Speech Processor
-- Splits long text into model-friendly chunks
-- Generates speech using voice cloning
-- Combines outputs and removes silence
+XTTS2 Batch Text-to-Speech Processor with Enhanced Chunk Handling
 """
 
 import os
@@ -17,186 +14,181 @@ from TTS.tts.configs.xtts_config import XttsConfig
 from TTS.tts.models.xtts import Xtts
 
 # Configuration constants
-CONFIG_PATH = "./models/xtts2/config.json"
-CHECKPOINT_DIR = "./models/xtts2/"
-SPEAKER_WAV = "small.wav"  # Reference audio for voice cloning
+CONFIG_PATH = "/home/jari/PycharmProjects/TTS/models/xtts2/config.json"
+CHECKPOINT_DIR = "/home/jari/PycharmProjects/TTS/models/xtts2/"
+SPEAKER_WAV = "small.wav"
 TEXT_FILE = "text_to_be_spoken.txt"
-OUTPUT_DIR = "./tts_output"
+OUTPUT_DIR = "/home/jari/PycharmProjects/TTS/Jari/tts_output"
 OUTPUT_FILE = "combined_audio.wav"
-MAX_CHUNK_LENGTH = 240  # Optimal chunk size for XTTS2 (characters)
-SILENCE_THRESHOLD = -40  # dBFS for silence removal
-SILENCE_LEN = 100  # ms of silence to detect
+MAX_CHUNK_LENGTH = 200  # Reduced for safety margin
+SILENCE_THRESHOLD = -35
+SILENCE_LEN = 500
+MAX_SENTENCES_PER_CHUNK = 4
 
-# Initialize NLTK resources
 nltk.download('punkt', quiet=True)
 
 
 def clean_text(text):
-    """
-    Normalize and sanitize input text
-    Args:
-        text: Raw input text
-    Returns:
-        str: Cleaned text with standardized formatting
-    """
-    text = re.sub(r'\s+', ' ', text)  # Collapse multiple whitespaces
-    text = re.sub(r'[^A-Za-z0-9 .,!?\'"\-:;()…]', '', text)  # Remove special chars
+    """Enhanced text cleaning with punctuation spacing"""
+    text = re.sub(r'(?<=[.,!?])(?=[^\s])', r' ', text)  # Fix missing spaces
+    text = re.sub(r'\s+', ' ', text)
+    text = re.sub(r'[^A-Za-z0-9 .,!?\'"\-:;()…]', '', text)
     return text.strip()
 
 
 def split_text(text, max_length=MAX_CHUNK_LENGTH):
-    """
-    Split text into chunks respecting sentence boundaries and max length
-    Args:
-        text: Input text to split
-        max_length: Maximum character length per chunk
-    Returns:
-        list: Text chunks optimized for TTS processing
-    """
+    """Safer splitting with sentence limits"""
     sentences = sent_tokenize(text)
     chunks = []
     current_chunk = ""
+    sentence_count = 0
 
     for sentence in sentences:
-        # Account for space that will be added
         projected_length = len(current_chunk) + len(sentence) + 1
+        sentence_count += 1
 
-        if projected_length > max_length:
+        if (projected_length > max_length) or (sentence_count > MAX_SENTENCES_PER_CHUNK):
             if current_chunk:
                 chunks.append(current_chunk.strip())
                 current_chunk = ""
-
-            # Handle sentences exceeding max_length
-            while len(sentence) > max_length:
-                # Find optimal split points (prioritizing punctuation)
-                split_pos = max(
-                    sentence[:max_length].rfind('. '),
-                    sentence[:max_length].rfind(', '),
-                    sentence[:max_length].rfind('! '),
-                    sentence[:max_length].rfind('? '),
-                    sentence[:max_length].rfind(' ')
-                )
-
-                if split_pos == -1:
-                    split_pos = max_length - 1
-
-                chunks.append(sentence[:split_pos].strip() + "...")
-                sentence = "..." + sentence[split_pos + 1:].lstrip()
+                sentence_count = 0
 
         current_chunk += sentence + " "
 
     if current_chunk.strip():
         chunks.append(current_chunk.strip())
 
+    print(f"\n🔍 Split into {len(chunks)} chunks:")
+    for i, chunk in enumerate(chunks, 1):
+        print(f"Chunk {i}: {len(chunk)} chars")
     return chunks
 
 
 def initialize_model():
-    """Initialize and configure XTTS2 model"""
     print("🔄 Initializing XTTS2 model...")
     config = XttsConfig()
     config.load_json(CONFIG_PATH)
     model = Xtts.init_from_config(config)
-    model.load_checkpoint(
-        config,
-        checkpoint_dir=CHECKPOINT_DIR,
-        use_deepspeed=False
-    )
+    model.load_checkpoint(config, checkpoint_dir=CHECKPOINT_DIR, use_deepspeed=False)
     model.cuda()
     return model
 
 
 def generate_voice_latents(model):
-    """Generate voice conditioning latents from reference audio"""
     print("🔊 Computing voice conditioning latents...")
     return model.get_conditioning_latents(audio_path=[SPEAKER_WAV])
 
 
+def validate_audio(output_path, chunk):
+    """Validate audio duration meets expectations"""
+    audio = AudioSegment.from_wav(output_path)
+    duration = len(audio) / 1000  # Convert to seconds
+    min_expected = len(chunk) * 0.055  # 55ms per character minimum
+
+    if duration < min_expected:
+        print(f"⚠️ Short audio: {duration:.1f}s (expected >{min_expected:.1f}s)")
+        return False
+    return True
+
+
 def process_text_chunks(model, latents, chunks):
-    """Process text chunks through TTS pipeline"""
     os.makedirs(OUTPUT_DIR, exist_ok=True)
 
     for i, chunk in enumerate(chunks, 1):
+        print(f"\n📄 Processing chunk {i}/{len(chunks)}:")
+        print(chunk)
+        print(f"Character count: {len(chunk)}/{MAX_CHUNK_LENGTH}")
+
         if len(chunk) > MAX_CHUNK_LENGTH:
-            print(f"⚠️ Chunk {i} exceeds limit ({len(chunk)} chars). Truncating...")
+            print(f"⚠️ Truncating {len(chunk) - MAX_CHUNK_LENGTH} characters")
             chunk = chunk[:MAX_CHUNK_LENGTH]
 
-        print(f"🎙 Processing chunk {i}/{len(chunks)}...")
-
-        # Generate audio with optimized parameters
+        # Initial generation attempt
         out = model.inference(
             text=chunk,
             language="en",
             gpt_cond_latent=latents[0],
             speaker_embedding=latents[1],
-            temperature=0.45,  # Balances creativity and stability
-            repetition_penalty=2.0,  # Reduces word repetition
-            speed=1.1,  # Slightly faster than default
-            enable_text_splitting=False  # Respect our chunk boundaries
+            temperature=0.65,
+            repetition_penalty=1.5,
+            speed=1.0,
+            length_penalty=1.0,
+            enable_text_splitting=False
         )
 
         output_path = os.path.join(OUTPUT_DIR, f"chunk_{i:03d}.wav")
-        torchaudio.save(
-            output_path,
-            torch.tensor(out["wav"]).unsqueeze(0),
-            24000  # Sample rate
-        )
+        torchaudio.save(output_path, torch.tensor(out["wav"]).unsqueeze(0), 24000)
+
+        # Validation and retry if needed
+        if not validate_audio(output_path, chunk):
+            print("🔄 Retrying with adjusted parameters...")
+            out = model.inference(
+                text=chunk,
+                language="en",
+                gpt_cond_latent=latents[0],
+                speaker_embedding=latents[1],
+                temperature=0.75,
+                repetition_penalty=1.3,
+                speed=0.95,
+                length_penalty=1.2,
+                enable_text_splitting=False
+            )
+            torchaudio.save(output_path, torch.tensor(out["wav"]).unsqueeze(0), 24000)
+
         print(f"✅ Saved: {output_path}")
 
 
 def combine_and_clean_audio():
-    """Combine audio chunks and remove silence"""
     print("\n🔊 Combining audio segments...")
-
-    # Get and sort chunk files numerically
     audio_files = sorted(
         [f for f in os.listdir(OUTPUT_DIR) if f.endswith(".wav")],
         key=lambda f: int(re.search(r'(\d+)', f).group())
     )
 
-    if not audio_files:
-        raise FileNotFoundError("No audio chunks found for combining")
-
-    # Initialize with first segment
     combined = AudioSegment.from_wav(os.path.join(OUTPUT_DIR, audio_files[0]))
-
-    # Concatenate remaining segments
     for audio_file in audio_files[1:]:
         combined += AudioSegment.from_wav(os.path.join(OUTPUT_DIR, audio_file))
 
-    # Save raw combined file
     combined.export(OUTPUT_FILE, format="wav")
 
-    # Remove silence and re-export
-    print("\n🔇 Removing silence from final output...")
+    print("\n🔇 Removing silence...")
     audio = AudioSegment.from_wav(OUTPUT_FILE)
     audio = audio.strip_silence(
         silence_len=SILENCE_LEN,
-        silence_thresh=SILENCE_THRESHOLD
+        silence_thresh=SILENCE_THRESHOLD,
+        padding=100
     )
     audio.export(OUTPUT_FILE, format="wav")
-    print(f"🎉 Final output saved to: {OUTPUT_FILE}")
+    print(f"🎉 Final output: {OUTPUT_FILE}")
+
+    return audio_files
+
+
+def cleanup_temp_files(temp_files):
+    print("\n🧹 Cleaning temporary files...")
+    deleted_count = 0
+    for temp_file in temp_files:
+        try:
+            os.remove(os.path.join(OUTPUT_DIR, temp_file))
+            deleted_count += 1
+        except Exception as e:
+            print(f"⚠️ Error deleting {temp_file}: {str(e)}")
+    print(f"🗑️ Removed {deleted_count}/{len(temp_files)} files")
 
 
 def main():
-    """Main processing pipeline"""
-    # Initialize TTS system
     model = initialize_model()
     voice_latents = generate_voice_latents(model)
 
-    # Process input text
-    print("📖 Processing input text...")
     with open(TEXT_FILE, "r", encoding="utf-8") as f:
         raw_text = f.read()
 
     cleaned_text = clean_text(raw_text)
     chunks = split_text(cleaned_text)
 
-    # Generate speech
     process_text_chunks(model, voice_latents, chunks)
-
-    # Post-process audio
-    combine_and_clean_audio()
+    temp_files = combine_and_clean_audio()
+    cleanup_temp_files(temp_files)
 
 
 if __name__ == "__main__":
